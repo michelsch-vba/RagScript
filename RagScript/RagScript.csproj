@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<!-- Mude de net8.0 para net8.0-windows -->
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<!-- Adiciona suporte ao Windows Forms -->
+		<UseWindowsForms>true</UseWindowsForms>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Google.GenAI" Version="*" />
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
+	</ItemGroup>
+
+</Project>
