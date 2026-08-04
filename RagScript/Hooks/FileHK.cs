@@ -1,6 +1,9 @@
-﻿using FreeRag.IndexerConsole; // Para usar a classe DocumentoVetorial
+﻿using FreeRag.IndexerConsole;
 using Google.GenAI;
 using Google.GenAI.Types;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using RagScript.Models;
 using System;
 using System.Collections.Generic;
@@ -10,181 +13,288 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
 using static RagScript.Hooks.CodeChunker;
-using static RagScript.Hooks.RagHook;
 
-namespace RagScript.Hooks;
-
+namespace RagScript.Hooks
+{
     public class ApiHook
     {
+        private readonly HttpClient _httpClient = new HttpClient();
+        private readonly List<string> _apiKeys = new();
+        private readonly Dictionary<string, DateTime> _cooldowns = new();
+        private int _chaveIndex = 0;
+        private readonly object _lockObject = new object();
 
-    public async Task<string> ObteroudarKey()
+        public void CarregarChaves(IEnumerable<string> chaves)
         {
-            JsonSerializerOptions options = new JsonSerializerOptions() { WriteIndented = true };
+            lock (_lockObject)
+            {
+                _apiKeys.Clear();
+                _apiKeys.AddRange(chaves.Where(k => !string.IsNullOrWhiteSpace(k)));
+                _chaveIndex = 0;
+            }
+        }
 
+        private string? ObterProximaChaveValida()
+        {
+            lock (_lockObject)
+            {
+                if (_apiKeys.Count == 0) return null;
+
+                int tentativas = 0;
+                while (tentativas < _apiKeys.Count)
+                {
+                    string chave = _apiKeys[_chaveIndex];
+                    _chaveIndex = (_chaveIndex + 1) % _apiKeys.Count;
+
+                    if (_cooldowns.TryGetValue(chave, out DateTime bloqueadaAte))
+                    {
+                        if (DateTime.UtcNow < bloqueadaAte)
+                        {
+                            tentativas++;
+                            continue;
+                        }
+                        _cooldowns.Remove(chave);
+                    }
+
+                    return chave;
+                }
+
+                return null;
+            }
+        }
+
+        private void BloquearChave(string chave, TimeSpan tempo)
+        {
+            lock (_lockObject)
+            {
+                _cooldowns[chave] = DateTime.UtcNow.Add(tempo);
+            }
+        }
+
+        public async Task<float[]> GerarEmbeddingHttpAsync(string texto)
+        {
+            int tentativamax = 5;
+
+            for (int tentativa = 1; tentativa <= tentativamax; tentativa++)
+            {
+                string? apiKey = ObterProximaChaveValida();
+
+                if (string.IsNullOrEmpty(apiKey))
+                {
+                    Console.WriteLine("\n⚠️ Todas as chaves do pool estão bloqueadas/temporariamente sem cota. Aguardando 15s...");
+                    await Task.Delay(15000);
+                    continue;
+                }
+
+                string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={apiKey}";
+                var payload = new
+                {
+                    content = new
+                    {
+                        parts = new[] { new { text = texto } }
+                    }
+                };
+
+                string jsonPayload = JsonSerializer.Serialize(payload);
+
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Post, url)
+                    {
+                        Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+                    };
+
+                    using var response = await _httpClient.SendAsync(request);
+
+                    if ((int)response.StatusCode == 429)
+                    {
+                        Console.WriteLine($"\n⚠️ Rate Limit (429) na chave [{MascararKey(apiKey)}]. Ativando cooldown de 60s e alternando chave...");
+                        BloquearChave(apiKey, TimeSpan.FromSeconds(60));
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string erroCorpo = await response.Content.ReadAsStringAsync();
+                        Console.WriteLine($"\n❌ Erro na API HTTP ({response.StatusCode}): {erroCorpo}");
+                        return Array.Empty<float>();
+                    }
+
+                    string jsonResponse = await response.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(jsonResponse);
+
+                    if (doc.RootElement.TryGetProperty("embedding", out var embeddingProp) &&
+                        embeddingProp.TryGetProperty("values", out var valuesProp))
+                    {
+                        return valuesProp.EnumerateArray()
+                            .Select(v => v.GetSingle())
+                            .ToArray();
+                    }
+
+                    return Array.Empty<float>();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"\n❌ Exceção ao gerar embedding: {ex.Message}");
+                }
+            }
+
+            return Array.Empty<float>();
+        }
+
+        public async Task<List<string>> ObteroudarKeysAsync()
+        {
+            JsonSerializerOptions options = new JsonSerializerOptions { WriteIndented = true };
             string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
             Directory.CreateDirectory(pastaApp);
-
             string arquivo = Path.Combine(pastaApp, "key.json");
-            string apiKey = string.Empty;
 
-            // 1. Tenta ler chave existente no arquivo
+            List<string> chavesCarregadas = new List<string>();
+
             if (System.IO.File.Exists(arquivo))
             {
                 string conteudo = System.IO.File.ReadAllText(arquivo);
-
                 if (!string.IsNullOrWhiteSpace(conteudo))
                 {
-                    Options keySalva = JsonSerializer.Deserialize<Options>(conteudo, options) ?? new Options(string.Empty);
-
-                    if (!string.IsNullOrEmpty(keySalva.key))
+                    try
                     {
-                        apiKey = keySalva.key;
-
-                        string chaveMascarada = MascararKey(apiKey);
-                        Console.WriteLine($"\n🔑 Chave encontrada no sistema: {chaveMascarada}");
-                        Console.WriteLine("---------------------------------------------");
-                        Console.WriteLine("[1] Usar a chave atual");
-                        Console.WriteLine("[2] Alterar / Editar a API Key");
-                        Console.WriteLine("[3] Voltar");
-                        Console.Write("Escolha uma opção: ");
-
-                        string opcao = Console.ReadLine()?.Trim() ?? string.Empty;
-
-                        if (opcao == "1")
+                        var config = JsonSerializer.Deserialize<Options>(conteudo, options);
+                        if (config?.Keys != null && config.Keys.Count > 0)
                         {
-                            // Testa a chave salva para garantir que continua funcional antes de retornar
-                            bool valida = await TestarApiKeyAsync(apiKey);
-                            if (valida)
+                            chavesCarregadas = config.Keys;
+                            Console.WriteLine($"\n🔑 {chavesCarregadas.Count} chave(s) encontrada(s) no sistema:");
+                            foreach (var k in chavesCarregadas)
                             {
-                                return apiKey;
+                                Console.WriteLine($" - {MascararKey(k)}");
                             }
+                            Console.WriteLine("---------------------------------------------");
+                            Console.WriteLine("[1] Usar as chaves atuais");
+                            Console.WriteLine("[2] Cadastrar novo grupo de chaves");
+                            Console.WriteLine("[3] Voltar");
+                            Console.Write("Escolha uma opção: ");
 
-                            Console.WriteLine("⚠️ Não foi possível validar a chave salva no momento. Informe uma nova ou tente mais tarde.");
-                        }
-                        else if (opcao == "3")
-                        {
-                            Console.WriteLine("Operação cancelada pelo usuário.");
-                            return string.Empty;
-                        }
+                            string opcao = Console.ReadLine()?.Trim() ?? string.Empty;
 
-                        apiKey = string.Empty; // Reseta se escolheu [2] ou se a chave salva falhou
+                            if (opcao == "1")
+                            {
+                                CarregarChaves(chavesCarregadas);
+                                return chavesCarregadas;
+                            }
+                            if (opcao == "3") return new List<string>();
+                        }
+                    }
+                    catch
+                    {
+                        // Suporta transição caso o arquivo antigo contivesse apenas a string "key"
                     }
                 }
             }
 
-            // 2. Loop para digitação e VALIDAÇÃO ANTES DE SALVAR
-            Console.WriteLine("\n⚠️ Informe sua API Key do Gemini.");
+            List<string> novasChaves = new List<string>();
+            Console.WriteLine("\n⚠️ Cadastre as API Keys do Gemini. Digite 'fim' para concluir ou 'sair' para cancelar.");
 
-            while (string.IsNullOrEmpty(apiKey))
+            while (true)
             {
-                Console.Write("\nDigite a nova API Key (ou 'sair' para encerrar): ");
+                Console.Write($"Digite a API Key #{novasChaves.Count + 1}: ");
                 string input = Console.ReadLine()?.Trim() ?? string.Empty;
 
-                if (input.Equals("sair", StringComparison.OrdinalIgnoreCase))
+                if (input.Equals("sair", StringComparison.OrdinalIgnoreCase)) return new List<string>();
+                if (input.Equals("fim", StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine("Operação cancelada.");
-                    return string.Empty;
+                    if (novasChaves.Count > 0) break;
+                    Console.WriteLine("❌ Insira ao menos uma chave válida antes de finalizar.");
+                    continue;
                 }
 
                 if (string.IsNullOrWhiteSpace(input))
                 {
-                    Console.WriteLine("❌ Chave não pode ser vazia. Tente novamente.");
+                    Console.WriteLine("❌ A chave não pode ser vazia.");
                     continue;
                 }
 
-                // Testamos a API Key na nuvem antes de criar o arquivo
-                bool passouNoTeste = await TestarApiKeyAsync(input);
-
-                if (passouNoTeste)
+                bool valida = await TestarApiKeyAsync(input);
+                if (valida)
                 {
-                    apiKey = input;
-
-                    try
-                    {
-                        Options novoOptions = new Options(apiKey);
-                        string jsonParaSalvar = JsonSerializer.Serialize(novoOptions, options);
-                        System.IO.File.WriteAllText(arquivo, jsonParaSalvar);
-                        Console.WriteLine($"✅ API Key validada e salva em: {arquivo}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠️ Chave válida, mas ocorreu um erro ao salvar o arquivo: {ex.Message}");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("❌ Não foi possível validar essa chave. Verifique se digitou corretamente.");
+                    novasChaves.Add(input);
+                    Console.WriteLine("✅ Chave validada e adicionada ao pool!");
                 }
             }
 
-            return apiKey;
-        }
-
-    
-    public async Task<bool> TestarApiKeyAsync(string apiKey)
-    {
-        if (string.IsNullOrWhiteSpace(apiKey)) return false;
-
-        Console.WriteLine("📡 Validando API Key na nuvem...");
-
-        try
-        {
-            // Testa a chave listando os modelos disponíveis (não consome cota de texto e não quebra por modelo antigo)
-            using var client = new HttpClient();
-            string url = $"https://generativelanguage.googleapis.com/v1beta/models?key={apiKey}";
-
-            var response = await client.GetAsync(url);
-
-            if (response.IsSuccessStatusCode)
+            if (novasChaves.Count > 0)
             {
-                return true;
+                try
+                {
+                    Options novoOptions = new Options(novasChaves);
+                    string jsonParaSalvar = JsonSerializer.Serialize(novoOptions, options);
+                    System.IO.File.WriteAllText(arquivo, jsonParaSalvar);
+                    Console.WriteLine($"✅ {novasChaves.Count} chave(s) salvas em: {arquivo}");
+                    CarregarChaves(novasChaves);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Chaves válidas, mas erro ao salvar arquivo: {ex.Message}");
+                }
             }
 
-            string erro = await response.Content.ReadAsStringAsync();
-            Console.WriteLine($"❌ Chave recusada pela API ({response.StatusCode}): {erro}");
-            return false;
+            return novasChaves;
         }
-        catch (Exception ex)
+
+        public async Task<bool> TestarApiKeyAsync(string apiKey)
         {
-            Console.WriteLine($"❌ Falha de conexão ao validar chave: {ex.Message}");
-            return false;
+            if (string.IsNullOrWhiteSpace(apiKey)) return false;
+            try
+            {
+                using var client = new HttpClient();
+                string url = $"https://generativelanguage.googleapis.com/v1beta/models?key={apiKey}";
+                var response = await client.GetAsync(url);
+                return response.IsSuccessStatusCode;
+            }
+            catch
+            {
+                return false;
+            }
         }
-    }
 
-    private string MascararKey(string key)
+        private string MascararKey(string key)
         {
-            if (string.IsNullOrEmpty(key) || key.Length <= 8)
-                return "****";
-
+            if (string.IsNullOrEmpty(key) || key.Length <= 8) return "****";
             return $"{key[..6]}...{key[^4..]}";
         }
     }
 
     public class RagHook
     {
-        private static readonly HttpClient _httpClient = new HttpClient();
+        private readonly ApiHook _apiHook;
 
-    // Pastas do sistema/build que devem ser ignoradas no escaneamento
-    private static readonly HashSet<string> PastasIgnoradas = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "bin", "obj", ".vs", ".git", ".idea", "node_modules", "packages"
-    };
+        public RagHook()
+        {
+            _apiHook = new ApiHook();
+        }
 
-        // Extensões binárias ignoradas na vetorização
+        public RagHook(ApiHook apiHook)
+        {
+            _apiHook = apiHook;
+        }
+
+        public async Task InicializarChavesAsync()
+        {
+            await _apiHook.ObteroudarKeysAsync();
+        }
+
+        private static readonly HashSet<string> PastasIgnoradas = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "bin", "obj", ".vs", ".git", ".idea", "node_modules", "packages"
+        };
+
         private static readonly HashSet<string> ExtensoesBinariasIgnoradas = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".db", ".sqlite", ".db-shm", ".db-wal", ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".dll", ".exe", ".pdb"
-    };
+        {
+            ".db", ".sqlite", ".db-shm", ".db-wal", ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".dll", ".exe", ".pdb"
+        };
 
-        
         public string SelecionarPastaOrigem()
         {
             string caminhoSelecionado = string.Empty;
@@ -215,49 +325,45 @@ namespace RagScript.Hooks;
             return caminhoSelecionado;
         }
 
-
-    private IEnumerable<string> ObterArquivosValidos(string caminhoPasta)
-    {
-        return Directory.EnumerateFiles(caminhoPasta, "*.*", SearchOption.AllDirectories)
-            .Where(arquivo => !CaminhoContemPastaIgnorada(arquivo.AsSpan()));
-    }
-
-    private static bool CaminhoContemPastaIgnorada(ReadOnlySpan<char> caminho)
-    {
-        // Percorre cada caractere / trecho do caminho usando slicing sem alocar strings
-        while (!caminho.IsEmpty)
+        private IEnumerable<string> ObterArquivosValidos(string caminhoPasta)
         {
-            int index = caminho.IndexOfAny(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-
-            ReadOnlySpan<char> segmento;
-            if (index < 0)
-            {
-                segmento = caminho;
-                caminho = ReadOnlySpan<char>.Empty;
-            }
-            else
-            {
-                segmento = caminho.Slice(0, index);
-                caminho = caminho.Slice(index + 1);
-            }
-
-            if (segmento.IsEmpty) continue;
-
-            // Verifica contra o HashSet de pastas ignoradas
-            foreach (var pasta in PastasIgnoradas)
-            {
-                if (segmento.Equals(pasta.AsSpan(), StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
+            return Directory.EnumerateFiles(caminhoPasta, "*.*", SearchOption.AllDirectories)
+                .Where(arquivo => !CaminhoContemPastaIgnorada(arquivo.AsSpan()));
         }
 
-        return false;
-    }
+        private static bool CaminhoContemPastaIgnorada(ReadOnlySpan<char> caminho)
+        {
+            while (!caminho.IsEmpty)
+            {
+                int index = caminho.IndexOfAny(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
+                ReadOnlySpan<char> segmento;
+                if (index < 0)
+                {
+                    segmento = caminho;
+                    caminho = ReadOnlySpan<char>.Empty;
+                }
+                else
+                {
+                    segmento = caminho.Slice(0, index);
+                    caminho = caminho.Slice(index + 1);
+                }
 
-    public List<string> SelecionarExtensoes(string caminhoPasta)
+                if (segmento.IsEmpty) continue;
+
+                foreach (var pasta in PastasIgnoradas)
+                {
+                    if (segmento.Equals(pasta.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        public List<string> SelecionarExtensoes(string caminhoPasta)
         {
             var todosArquivosValidos = ObterArquivosValidos(caminhoPasta).ToList();
 
@@ -331,144 +437,95 @@ namespace RagScript.Hooks;
             return selecionadas.Distinct().ToList();
         }
 
-
-    public async Task<List<DocumentoVetorial>> ProcessarArquivosERagAsync(string caminhoPasta, List<string> extensoes, string apiKey)
-    {
-        var documentosVetoriais = new List<DocumentoVetorial>();
-
-        var arquivosParaProcessar = ObterArquivosValidos(caminhoPasta)
-            .Where(f => extensoes.Contains(Path.GetExtension(f).ToLower()))
-            .ToList();
-
-        Console.WriteLine($"\n🧠 Processando {arquivosParaProcessar.Count} arquivos para vetorização...\n");
-
-        foreach (var arquivo in arquivosParaProcessar)
+        public async Task<List<DocumentoVetorial>> ProcessarArquivosERagAsync(string caminhoPasta, List<string> extensoes)
         {
-            string ext = Path.GetExtension(arquivo).ToLower();
+            await InicializarChavesAsync(); // Garante a leitura síncrona/aguardada das chaves
+            var documentosVetoriais = new List<DocumentoVetorial>();
 
-            if (ExtensoesBinariasIgnoradas.Contains(ext)) continue;
+            var arquivosParaProcessar = ObterArquivosValidos(caminhoPasta)
+                .Where(f => extensoes.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
 
-            try
+            Console.WriteLine($"\n🧠 Processando {arquivosParaProcessar.Count} arquivos para vetorização...\n");
+
+            foreach (var arquivo in arquivosParaProcessar)
             {
-                string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
-                if (string.IsNullOrWhiteSpace(conteudo)) continue;
+                string ext = Path.GetExtension(arquivo).ToLower();
 
-                string caminhoRelativo = Path.GetRelativePath(caminhoPasta, arquivo);
-                string hash = GerarHashSHA256(conteudo);
-                string metadadosExtraidos = (ext == ".cs") ? ExtrairEstruturaCSharp(conteudo) : $"Arquivo {ext}";
+                if (ExtensoesBinariasIgnoradas.Contains(ext)) continue;
 
-                // 💡 CHUNKING: Se for C#, quebra em métodos. Se não, trata como bloco único.
-                var pedacos = (ext == ".cs")
-                    ? CodeChunker.QuebrarCodigoCSharp(conteudo)
-                    : new List<ChunkResult> { new ChunkResult { Tipo = "Documento", NomeMembro = Path.GetFileName(arquivo), Conteudo = conteudo } };
-
-                foreach (var chunk in pedacos)
-                {
-                    // Enriquecimento do Chunk com o Contexto Pai (Arquivo e Namespace/Classe)
-                    string textoParaEmbedding = $"[ARQUIVO: {caminhoRelativo}]\n" +
-                                                $"[MEMBER/TIPO: {chunk.Tipo} -> {chunk.NomeMembro}]\n" +
-                                                $"[ESTRUTURA/METADADOS: {metadadosExtraidos}]\n\n" +
-                                                $"[CÓDIGO/CONTEÚDO]:\n{chunk.Conteudo}";
-
-                    Console.Write($"🔄 Vetorizando Chunk ({chunk.NomeMembro}) em {caminhoRelativo}... ");
-
-                    float[] vectorValues = await GerarEmbeddingHttpAsync(textoParaEmbedding, apiKey);
-
-                    if (vectorValues.Length > 0)
-                    {
-                        documentosVetoriais.Add(new DocumentoVetorial
-                        {
-                            CaminhoRelativo = caminhoRelativo,
-                            NomeArquivo = Path.GetFileName(arquivo),
-                            HashConteudo = hash,
-                            TipoChunk = chunk.Tipo,
-                            NomeMembro = chunk.NomeMembro,
-                            HierarquiaCompleta = chunk.HierarquiaCompleta,
-                            Metadados = metadadosExtraidos,
-                            ConteudoTexto = chunk.Conteudo, // Guarda apenas o código do método/bloco
-                            Embedding = vectorValues
-                        });
-
-                        Console.WriteLine("✅ OK");
-                    }
-                    else
-                    {
-                        Console.WriteLine("⚠️ Falha ao vetorizar chunk.");
-                    }
-
-                    await Task.Delay(1500); // Respeita cota da API
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Erro ao processar {Path.GetFileName(arquivo)}: {ex.Message}");
-            }
-        }
-
-        return documentosVetoriais;
-    }
-
-    public async Task<float[]> GerarEmbeddingHttpAsync(string texto, string apiKey)
-        {
-        string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={apiKey}";
-        var payload = new
-            {
-                content = new
-                {
-                    parts = new[] { new { text = texto } }
-                }
-            };
-
-            string jsonPayload = JsonSerializer.Serialize(payload);
-            int tentativamax = 5;
-            // Tenta até 3 vezes caso bata no Rate Limit (HTTP 429)
-            for (int tentativa = 1; tentativa <= tentativamax; tentativa++)
-            {
                 try
                 {
-                    using var request = new HttpRequestMessage(HttpMethod.Post, url)
-                    {
-                        Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
-                    };
+                    string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
+                    if (string.IsNullOrWhiteSpace(conteudo)) continue;
 
-                    using var response = await _httpClient.SendAsync(request);
+                    string caminhoRelativo = Path.GetRelativePath(caminhoPasta, arquivo);
+                    string hash = GerarHashSHA256(conteudo);
+                    string metadadosExtraidos = (ext == ".cs") ? ExtrairEstruturaCSharp(conteudo) : $"Arquivo {ext}";
 
-                    // Se tomou Rate Limit (429), aguarda 10 segundos e tenta de novo
-                    if ((int)response.StatusCode == 429)
+                    var pedacos = (ext == ".cs")
+                        ? CodeChunker.QuebrarCodigoCSharp(conteudo)
+                        : new List<ChunkResult> { new ChunkResult { Tipo = "Documento", NomeMembro = Path.GetFileName(arquivo), Conteudo = conteudo } };
+
+                    foreach (var chunk in pedacos)
                     {
-                        Console.WriteLine($"\n⚠️ Limite de requisições por minuto atingido (429). Aguardando 10s (Tentativa {tentativa}/{tentativamax})...");
-                        await Task.Delay(20000);
-                        continue;
+                        string textoParaEmbedding = $"[ARQUIVO: {caminhoRelativo}]\n" +
+                                                    $"[MEMBER/TIPO: {chunk.Tipo} -> {chunk.NomeMembro}]\n" +
+                                                    $"[ESTRUTURA/METADADOS: {metadadosExtraidos}]\n\n" +
+                                                    $"[CÓDIGO/CONTEÚDO]:\n{chunk.Conteudo}";
+
+                        Console.Write($"🔄 Vetorizando Chunk ({chunk.NomeMembro}) em {caminhoRelativo}... ");
+
+                        // Loop de Resiliência: até 3 tentativas por chunk antes de descartar
+                        float[] vectorValues = Array.Empty<float>();
+                        int tentativaChunk = 0;
+
+                        while (vectorValues.Length == 0 && tentativaChunk < 3)
+                        {
+                            tentativaChunk++;
+                            vectorValues = await _apiHook.GerarEmbeddingHttpAsync(textoParaEmbedding);
+
+                            if (vectorValues.Length == 0 && tentativaChunk < 3)
+                            {
+                                Console.WriteLine($"\n⚠️ Tentativa {tentativaChunk} falhou. Re-tentando chunk em 2s...");
+                                await Task.Delay(2000);
+                            }
+                        }
+
+                        if (vectorValues.Length > 0)
+                        {
+                            documentosVetoriais.Add(new DocumentoVetorial
+                            {
+                                CaminhoRelativo = caminhoRelativo,
+                                NomeArquivo = Path.GetFileName(arquivo),
+                                HashConteudo = hash,
+                                TipoChunk = chunk.Tipo,
+                                NomeMembro = chunk.NomeMembro,
+                                HierarquiaCompleta = chunk.HierarquiaCompleta,
+                                Metadados = metadadosExtraidos,
+                                ConteudoTexto = chunk.Conteudo,
+                                Embedding = vectorValues
+                            });
+
+                            Console.WriteLine("✅ OK");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"❌ Chunk [{chunk.NomeMembro}] descartado após 3 tentativas.");
+                        }
+
+                        await Task.Delay(1500); // Delay seguro de 1500ms entre vetorizações
                     }
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        string erroCorpo = await response.Content.ReadAsStringAsync();
-                        Console.WriteLine($"\n❌ Erro na API HTTP ({response.StatusCode}): {erroCorpo}");
-                        return Array.Empty<float>();
-                    }
-
-                    string jsonResponse = await response.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(jsonResponse);
-
-                    if (doc.RootElement.TryGetProperty("embedding", out var embeddingProp) &&
-                        embeddingProp.TryGetProperty("values", out var valuesProp))
-                    {
-                        return valuesProp.EnumerateArray()
-                            .Select(v => v.GetSingle())
-                            .ToArray();
-                    }
-
-                    return Array.Empty<float>();
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"\n❌ Exceção ao gerar embedding: {ex.Message}");
+                    Console.WriteLine($"❌ Erro ao processar {Path.GetFileName(arquivo)}: {ex.Message}");
                 }
             }
 
-            return Array.Empty<float>();
+            return documentosVetoriais;
         }
+
         private string GerarHashSHA256(string texto)
         {
             using var sha256 = SHA256.Create();
@@ -476,288 +533,343 @@ namespace RagScript.Hooks;
             return Convert.ToHexString(bytes);
         }
 
-    private string ExtrairEstruturaCSharp(string codigo)
+        private string ExtrairEstruturaCSharp(string codigo)
+        {
+            if (string.IsNullOrWhiteSpace(codigo))
+                return "Arquivo C# Vazio";
+
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
+            CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
+
+            var estrutura = new List<string>();
+
+            var namespaceNode = root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
+            if (namespaceNode != null)
+            {
+                estrutura.Add($"Namespace: {namespaceNode.Name}");
+            }
+
+            var tipos = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>();
+
+            foreach (var tipo in tipos)
+            {
+                var sbTipo = new StringBuilder();
+
+                string tipoKIND = tipo.Kind().ToString().Replace("Declaration", "").ToLower();
+                sbTipo.Append($"{tipoKIND} {tipo.Identifier.Text}");
+
+                if (tipo.BaseList != null && tipo.BaseList.Types.Any())
+                {
+                    var herancas = tipo.BaseList.Types.Select(t => t.ToString().Trim());
+                    sbTipo.Append($" : {string.Join(", ", herancas)}");
+                }
+
+                var propriedades = (tipo as TypeDeclarationSyntax)?.Members
+                                .OfType<PropertyDeclarationSyntax>()
+                                .Select(p => $"{p.Type} {p.Identifier.Text}")
+                                ?? Enumerable.Empty<string>();
+
+                if (propriedades.Any())
+                {
+                    sbTipo.Append($" [Props: {string.Join(", ", propriedades.Take(5))}{(propriedades.Count() > 5 ? "..." : "")}]");
+                }
+
+                estrutura.Add(sbTipo.ToString());
+            }
+
+            if (!estrutura.Any())
+            {
+                var enums = root.DescendantNodes().OfType<EnumDeclarationSyntax>();
+                if (enums.Any())
+                {
+                    return "Enums: " + string.Join(", ", enums.Select(e => e.Identifier.Text));
+                }
+
+                return "Estrutura C# Geral / Script";
+            }
+
+            return string.Join(" | ", estrutura);
+        }
+    }
+
+    public class RagSearchHook
     {
-        if (string.IsNullOrWhiteSpace(codigo))
-            return "Arquivo C# Vazio";
+        private readonly ApiHook _apiHook = new ApiHook();
 
-        SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
-        CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
-
-        var estrutura = new List<string>();
-
-        // 1. Extrai Namespace
-        var namespaceNode = root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
-        if (namespaceNode != null)
+        public async Task InicializarChavesAsync()
         {
-            estrutura.Add($"Namespace: {namespaceNode.Name}");
+            await _apiHook.ObteroudarKeysAsync();
         }
 
-        // 2. Extrai Tipos (Classes, Interfaces, Structs, Records)
-        var tipos = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>();
-
-        foreach (var tipo in tipos)
+        public string GerarPerguntaEstruturada(
+            string perguntaUsuario,
+            List<DocumentoVetorial> documentosRelevantes,
+            TipoPreset preset = TipoPreset.ArquiteturaERefatoracao)
         {
-            var sbTipo = new StringBuilder();
+            var sb = new StringBuilder();
 
-            // Captura o tipo (class, interface, record, struct) e o nome
-            string tipoKIND = tipo.Kind().ToString().Replace("Declaration", "").ToLower();
-            sbTipo.Append($"{tipoKIND} {tipo.Identifier.Text}");
+            sb.AppendLine("### 🤖 CONTEXTO DO PROJETO E SOLICITAÇÃO");
+            sb.AppendLine("Abaixo estão fornecidos os trechos de código e a estrutura de metadados extraídos da base do projeto via RAG sintático (Roslyn).\n");
 
-            // Captura Herança / Implementação de Interfaces
-            if (tipo.BaseList != null && tipo.BaseList.Types.Any())
+            sb.AppendLine("---");
+            sb.AppendLine("### 📁 CONTEXTO E METADADOS DOS ARQUIVOS (ROSLYN RAG)\n");
+
+            foreach (var doc in documentosRelevantes)
             {
-                var herancas = tipo.BaseList.Types.Select(t => t.ToString().Trim());
-                sbTipo.Append($" : {string.Join(", ", herancas)}");
+                sb.AppendLine($"#### 📄 Arquivo: `{doc.CaminhoRelativo}`");
+
+                if (!string.IsNullOrWhiteSpace(doc.TipoChunk) || !string.IsNullOrWhiteSpace(doc.NomeMembro))
+                {
+                    sb.AppendLine($"> **Elemento:** `{doc.TipoChunk}` -> `{doc.NomeMembro}`");
+                }
+
+                if (!string.IsNullOrWhiteSpace(doc.Metadados))
+                {
+                    sb.AppendLine($"> **Estrutura / Contrato:** `{doc.Metadados}`");
+                }
+
+                sb.AppendLine("```csharp");
+                sb.AppendLine(doc.ConteudoTexto);
+                sb.AppendLine("```\n");
             }
 
-            // Captura Membros/Propriedades para dar contexto ao RAG
-            var propriedades = (tipo as TypeDeclarationSyntax)?.Members
-                            .OfType<PropertyDeclarationSyntax>()
-                            .Select(p => $"{p.Type} {p.Identifier.Text}")
-                            ?? Enumerable.Empty<string>();
+            sb.AppendLine("---");
+            sb.AppendLine("### ❓ PERGUNTA / SOLICITAÇÃO DO USUÁRIO");
+            sb.AppendLine($"**\"{perguntaUsuario}\"**\n");
 
-            if (propriedades.Any())
+            sb.AppendLine("---");
+            sb.AppendLine("### 🎯 INSTRUÇÕES DE RESPOSTA");
+
+            switch (preset)
             {
-                sbTipo.Append($" [Props: {string.Join(", ", propriedades.Take(5))}{(propriedades.Count() > 5 ? "..." : "")}]");
+                case TipoPreset.SugestaoMelhoriaPerformance:
+                    sb.AppendLine("Atue como um Engenheiro de Performance C#/.NET. Responda seguindo a estrutura:");
+                    sb.AppendLine("1. **Gargalos Identificados:** Análise sintática/algorítmica de possíveis pontos de lentidão ou alocação excessiva de memória (GC).");
+                    sb.AppendLine("2. **Otimizações Propostas:** Sugestões de uso de Span<T>, Memory<T>, async/await ou estruturas de dados mais adequadas.");
+                    sb.AppendLine("3. **Código Refatorado:** Versão otimizada mantendo os mesmos contratos públicos.");
+                    break;
+
+                case TipoPreset.DocumentacaoTecnica:
+                    sb.AppendLine("Atue como um Technical Writer especializado em .NET. Responda seguindo a estrutura:");
+                    sb.AppendLine("1. **Visão Geral:** Resumo do propósito funcional das classes/métodos citados.");
+                    sb.AppendLine("2. **Documentação XML Docs:** Forneça os comentários `<summary>`, `<param>` e `<returns>` prontos para colar sobre o código.");
+                    sb.AppendLine("3. **Diagrama de Fluxo (Mermaid):** Exemplo visual básico do fluxo de execução, se aplicável.");
+                    break;
+
+                case TipoPreset.AnaliseDeBugsESeguranca:
+                    sb.AppendLine("Atue como um Especialista em Code Review e AppSec. Responda seguindo a estrutura:");
+                    sb.AppendLine("1. **Vulnerabilidades / Code Smells:** Identificação de falhas de concorrência, vazamento de recursos ou exceções não tratadas.");
+                    sb.AppendLine("2. **Plano de Mitigação:** Passo a passo para corrigir os riscos sem quebrar o sistema.");
+                    sb.AppendLine("3. **Código Corrigido:** Implementação segura com tratamento rigoroso de borda.");
+                    break;
+
+                case TipoPreset.CriacaoDeTestesUnitarios:
+                    sb.AppendLine("Atue como um Engenheiro de QA e Automação .NET. Responda seguindo a estrutura:");
+                    sb.AppendLine("1. **Cenários de Teste (AAA):** Lista de cenários positivos, negativos e de borda a serem testados.");
+                    sb.AppendLine("2. **Código de Teste:** Suíte completa usando xUnit/NUnit com Moq/NSubstitute e FluentAssertions.");
+                    break;
+
+                case TipoPreset.ArquiteturaERefatoracao:
+                default:
+                    sb.AppendLine("Atue como um Arquiteto de Software C#/.NET. Responda de forma objetiva e técnica seguindo a estrutura:");
+                    sb.AppendLine("1. **Resumo Executivo:** Explicação direta de 2 a 3 frases sobre a solução proposta.");
+                    sb.AppendLine("2. **Análise de Contexto:** Como o problema se relaciona com os membros/estruturas fornecidos acima.");
+                    sb.AppendLine("3. **Impactos na Arquitetura:** Possíveis efeitos colaterais nos tipos ou contratos relacionados.");
+                    sb.AppendLine("4. **Código / Refatoração:** Implementação pronta respeitando os padrões do projeto.");
+                    break;
             }
 
-            estrutura.Add(sbTipo.ToString());
+            return sb.ToString();
         }
 
-        // Se não encontrou tipos declarados (ex: Top-Level Statements ou apenas Enums)
-        if (!estrutura.Any())
+        public float CalcularScorePonderado(DocumentoVetorial doc, float[] embeddingPergunta, string perguntaUsuario)
         {
-            var enums = root.DescendantNodes().OfType<EnumDeclarationSyntax>();
-            if (enums.Any())
+            float baseCosineSim = CalcularSimilaridadeCosseno(doc.Embedding, embeddingPergunta);
+
+            if (baseCosineSim <= 0f) return 0f;
+
+            float bonusMetadados = 0f;
+            string perguntaLower = perguntaUsuario.ToLowerInvariant();
+
+            if (!string.IsNullOrWhiteSpace(doc.NomeMembro) &&
+                doc.NomeMembro.Length > 2 &&
+                perguntaLower.Contains(doc.NomeMembro.ToLowerInvariant()))
             {
-                return "Enums: " + string.Join(", ", enums.Select(e => e.Identifier.Text));
+                bonusMetadados += 0.25f;
             }
 
-            return "Estrutura C# Geral / Script";
-        }
-
-        return string.Join(" | ", estrutura);
-    }    
-}
-
-public class RagSearchHook
-{
-    RagHook rag = new RagHook();
-    public string GerarPerguntaEstruturada(string perguntaUsuario, List<DocumentoVetorial> documentosRelevantes)
-    {
-        var sb = new StringBuilder();
-
-        sb.AppendLine("### 🤖 CONTEXTO DO PROJETO E SOLICITAÇÃO");
-        sb.AppendLine("Você é um arquiteto de software e especialista em desenvolvimento C# / .NET.");
-        sb.AppendLine("Abaixo estão fornecidos os trechos de código e a estrutura de metadados extraídos da base do projeto via RAG sintático (Roslyn).\n");
-
-        sb.AppendLine("---");
-        sb.AppendLine("### 📁 CONTEXTO E METADADOS DOS ARQUIVOS (ROSLYN RAG)\n");
-
-        foreach (var doc in documentosRelevantes)
-        {
-            sb.AppendLine($"#### 📄 Arquivo: `{doc.CaminhoRelativo}`");
-
-            // 1. Exibe o Tipo e o Membro/Método capturado pelo Roslyn
-            if (!string.IsNullOrWhiteSpace(doc.TipoChunk) || !string.IsNullOrWhiteSpace(doc.NomeMembro))
+            if (!string.IsNullOrWhiteSpace(doc.HierarquiaCompleta) &&
+                doc.HierarquiaCompleta.Split('.').Any(parte => parte.Length > 3 && perguntaLower.Contains(parte.ToLowerInvariant())))
             {
-                sb.AppendLine($"> **Elemento:** `{doc.TipoChunk}` -> `{doc.NomeMembro}`");
+                bonusMetadados += 0.15f;
             }
 
-            // 2. Exibe a Estrutura / Metadados ricos (Namespaces, Heranças, Propriedades)
             if (!string.IsNullOrWhiteSpace(doc.Metadados))
             {
-                sb.AppendLine($"> **Estrutura / Contrato:** `{doc.Metadados}`");
+                string metadadosLower = doc.Metadados.ToLowerInvariant();
+                int matches = perguntaLower.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                           .Count(palavra => palavra.Length > 3 && metadadosLower.Contains(palavra));
+
+                if (matches > 0)
+                {
+                    bonusMetadados += Math.Min(matches * 0.05f, 0.15f);
+                }
             }
 
-            // 3. Bloco de código do Chunk
-            sb.AppendLine("```csharp");
-            sb.AppendLine(doc.ConteudoTexto);
-            sb.AppendLine("```\n");
+            return Math.Min(baseCosineSim + bonusMetadados, 1.0f);
         }
 
-        sb.AppendLine("---");
-        sb.AppendLine("### ❓ PERGUNTA DO USUÁRIO");
-        sb.AppendLine($"**\"{perguntaUsuario}\"**\n");
-
-        sb.AppendLine("---");
-        sb.AppendLine("### 🎯 INSTRUÇÕES DE RESPOSTA");
-        sb.AppendLine("Responda de forma objetiva e técnica seguindo a estrutura:");
-        sb.AppendLine("1. **Resumo Executivo:** Explicação direta de 2 a 3 frases sobre a solução proposta.");
-        sb.AppendLine("2. **Análise de Contexto:** Como o problema se relaciona com os membros/estruturas fornecidos acima.");
-        sb.AppendLine("3. **Impactos na Arquitetura:** Possíveis efeitos colaterais nos tipos ou contratos relacionados.");
-        sb.AppendLine("4. **Código / Refatoração (se aplicável):** Implementação pronta respeitando os padrões do projeto.");
-
-        return sb.ToString();
-    }
-
-    public float CalcularScorePonderado(
-    DocumentoVetorial doc,
-    float[] embeddingPergunta,
-    string perguntaUsuario)
-    {
-        // 1. Similaridade Semântica de Vetores (Cos Sim Base)
-        float baseCosineSim = CalcularSimilaridadeCosseno(doc.Embedding, embeddingPergunta);
-
-        if (baseCosineSim <= 0f) return 0f;
-
-        float bonusMetadados = 0f;
-        string perguntaLower = perguntaUsuario.ToLowerInvariant();
-
-        // 2. Pesos de Exatidão Léxica / Sintática via Roslyn
-
-        // A) Bônus se o nome do método/classe aparece diretamente na pergunta
-        if (!string.IsNullOrWhiteSpace(doc.NomeMembro) &&
-            doc.NomeMembro.Length > 2 &&
-            perguntaLower.Contains(doc.NomeMembro.ToLowerInvariant()))
+        public float CalcularSimilaridadeCosseno(float[] vetorA, float[] vetorB)
         {
-            bonusMetadados += 0.25f; // +25% de relevância
-        }
+            if (vetorA == null || vetorB == null || vetorA.Length != vetorB.Length)
+                return 0f;
 
-        // B) Bônus se o namespace ou caminho hierárquico (Ex: RagScript.Hooks) é citado
-        if (!string.IsNullOrWhiteSpace(doc.HierarquiaCompleta) &&
-            doc.HierarquiaCompleta.Split('.').Any(parte => parte.Length > 3 && perguntaLower.Contains(parte.ToLowerInvariant())))
-        {
-            bonusMetadados += 0.15f; // +15% de relevância
-        }
+            float dotProduct = 0f;
+            float normaA = 0f;
+            float normaB = 0f;
 
-        // C) Bônus se palavras-chave de propriedades ou interfaces dos metadados combinam
-        if (!string.IsNullOrWhiteSpace(doc.Metadados))
-        {
-            string metadadosLower = doc.Metadados.ToLowerInvariant();
-            int matches = perguntaLower.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                                       .Count(palavra => palavra.Length > 3 && metadadosLower.Contains(palavra));
-
-            if (matches > 0)
+            for (int i = 0; i < vetorA.Length; i++)
             {
-                bonusMetadados += Math.Min(matches * 0.05f, 0.15f); // Cap de +15%
+                dotProduct += vetorA[i] * vetorB[i];
+                normaA += vetorA[i] * vetorA[i];
+                normaB += vetorB[i] * vetorB[i];
             }
+
+            if (normaA == 0f || normaB == 0f)
+                return 0f;
+
+            return dotProduct / ((float)Math.Sqrt(normaA) * (float)Math.Sqrt(normaB));
         }
 
-        // Retorna o score combinado (com teto de 1.0)
-        return Math.Min(baseCosineSim + bonusMetadados, 1.0f);
-    }
-
-    public float CalcularSimilaridadeCosseno(float[] vetorA, float[] vetorB)
-    {
-        if (vetorA == null || vetorB == null || vetorA.Length != vetorB.Length)
-            return 0f;
-
-        float dotProduct = 0f;
-        float normaA = 0f;
-        float normaB = 0f;
-
-        for (int i = 0; i < vetorA.Length; i++)
+        public async Task<float[]> GerarEmbeddingPerguntaAsync(string pergunta)
         {
-            dotProduct += vetorA[i] * vetorB[i];
-            normaA += vetorA[i] * vetorA[i];
-            normaB += vetorB[i] * vetorB[i];
+            await InicializarChavesAsync();
+            return await _apiHook.GerarEmbeddingHttpAsync(pergunta);
         }
-
-        if (normaA == 0f || normaB == 0f)
-            return 0f;
-
-        return dotProduct / ((float)Math.Sqrt(normaA) * (float)Math.Sqrt(normaB));
     }
 
-    public async Task<float[]> GerarEmbeddingPerguntaAsync(string pergunta, string apiKey)
-    {
-        return await rag.GerarEmbeddingHttpAsync(pergunta, apiKey);
-    }
-}
-
-public static class CodeChunker
-{
     public class ChunkResult
     {
-        public string Tipo { get; set; } = "Bloco";
+        public string Tipo { get; set; } = string.Empty;
         public string NomeMembro { get; set; } = string.Empty;
         public string HierarquiaCompleta { get; set; } = string.Empty;
         public string Conteudo { get; set; } = string.Empty;
     }
 
-    public static List<ChunkResult> QuebrarCodigoCSharp(string codigo)
+    public static class CodeChunker
     {
-        var chunks = new List<ChunkResult>();
-
-        // 1. Traz a árvore sintática completa construída pelo Roslyn
-        SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
-        CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
-
-        // 2. Localiza todos os métodos do arquivo
-        var methodNodes = root.DescendantNodes().OfType<MethodDeclarationSyntax>().ToList();
-
-        // Fallback: Se não encontrar métodos (ex: DTOs puras, Enums, Structs de dados), captura classes/structs/records
-        if (!methodNodes.Any())
+        public static List<ChunkResult> QuebrarCodigoCSharp(string codigo)
         {
-            var typeNodes = root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>();
-            foreach (var typeNode in typeNodes)
+            if (string.IsNullOrWhiteSpace(codigo))
+                return new List<ChunkResult>();
+
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
+            CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
+
+            var collector = new CSharpSyntaxCollector();
+            collector.Visit(root);
+
+            var chunks = new List<ChunkResult>(collector.Methods.Count > 0 ? collector.Methods.Count : collector.Types.Count + 1);
+
+            if (collector.Methods.Count > 0)
             {
-                chunks.Add(new ChunkResult
+                foreach (var method in collector.Methods)
                 {
-                    Tipo = typeNode.Kind().ToString().Replace("Declaration", ""),
-                    NomeMembro = typeNode.Identifier.Text,
-                    HierarquiaCompleta = ObterCaminhoHierarquico(typeNode),
-                    Conteudo = typeNode.ToFullString().Trim()
-                });
+                    chunks.Add(new ChunkResult
+                    {
+                        Tipo = "Metodo",
+                        NomeMembro = method.Identifier.Text,
+                        HierarquiaCompleta = ObterCaminhoHierarquico(method),
+                        Conteudo = method.ToFullString().Trim()
+                    });
+                }
+                return chunks;
             }
 
-            // Se for um arquivo script isolado sem nada declarado
-            if (!chunks.Any() && !string.IsNullOrWhiteSpace(codigo))
+            if (collector.Types.Count > 0)
             {
-                chunks.Add(new ChunkResult
+                foreach (var typeNode in collector.Types)
                 {
-                    Tipo = "Arquivo/Estrutura",
-                    NomeMembro = "Geral",
-                    HierarquiaCompleta = "Geral",
-                    Conteudo = codigo
-                });
+                    ReadOnlySpan<char> kindName = typeNode.Kind().ToString().AsSpan();
+                    string tipoFormatado = kindName.EndsWith("Declaration")
+                        ? kindName.Slice(0, kindName.Length - "Declaration".Length).ToString()
+                        : kindName.ToString();
+
+                    chunks.Add(new ChunkResult
+                    {
+                        Tipo = tipoFormatado,
+                        NomeMembro = typeNode.Identifier.Text,
+                        HierarquiaCompleta = ObterCaminhoHierarquico(typeNode),
+                        Conteudo = typeNode.ToFullString().Trim()
+                    });
+                }
+                return chunks;
             }
+
+            chunks.Add(new ChunkResult
+            {
+                Tipo = "Arquivo/Estrutura",
+                NomeMembro = "Geral",
+                HierarquiaCompleta = "Geral",
+                Conteudo = codigo
+            });
 
             return chunks;
         }
 
-        // 3. Extrai cada método preservando o escopo correto e comentários (xml docs / trivia)
-        foreach (var method in methodNodes)
+        private static string ObterCaminhoHierarquico(SyntaxNode node)
         {
-            string nomeMetodo = method.Identifier.Text;
-            string hierarquia = ObterCaminhoHierarquico(method);
+            var nomes = new List<string>(4);
+            var atual = node.Parent;
 
-            chunks.Add(new ChunkResult
+            while (atual != null)
             {
-                Tipo = "Metodo",
-                NomeMembro = nomeMetodo,
-                HierarquiaCompleta = hierarquia,
-                // GetText() ou ToFullString() preservam comentários XML em cima do método
-                Conteudo = method.ToFullString().Trim()
-            });
+                if (atual is BaseTypeDeclarationSyntax typeDecl)
+                    nomes.Add(typeDecl.Identifier.Text);
+                else if (atual is BaseNamespaceDeclarationSyntax nsDecl)
+                    nomes.Add(nsDecl.Name.ToString());
+
+                atual = atual.Parent;
+            }
+
+            nomes.Reverse();
+            return string.Join(".", nomes);
         }
 
-        return chunks;
-    }
-
-    /// <summary>
-    /// Reconstrói o caminho sintático do membro (Ex: Meunamespace.MinhaClasse.MeuMetodo)
-    /// </summary>
-    private static string ObterCaminhoHierarquico(SyntaxNode node)
-    {
-        var nomes = new List<string>();
-        var atual = node;
-
-        while (atual != null)
+        private sealed class CSharpSyntaxCollector : CSharpSyntaxWalker
         {
-            if (atual is MethodDeclarationSyntax method)
-                nomes.Add(method.Identifier.Text);
-            else if (atual is BaseTypeDeclarationSyntax type)
-                nomes.Add(type.Identifier.Text);
-            else if (atual is BaseNamespaceDeclarationSyntax ns)
-                nomes.Add(ns.Name.ToString());
+            public List<MethodDeclarationSyntax> Methods { get; } = new(16);
+            public List<BaseTypeDeclarationSyntax> Types { get; } = new(8);
 
-            atual = atual.Parent;
+            public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
+            {
+                Methods.Add(node);
+                base.VisitMethodDeclaration(node);
+            }
+
+            public override void VisitClassDeclaration(ClassDeclarationSyntax node)
+            {
+                Types.Add(node);
+                base.VisitClassDeclaration(node);
+            }
+
+            public override void VisitStructDeclaration(StructDeclarationSyntax node)
+            {
+                Types.Add(node);
+                base.VisitStructDeclaration(node);
+            }
+
+            public override void VisitInterfaceDeclaration(InterfaceDeclarationSyntax node)
+            {
+                Types.Add(node);
+                base.VisitInterfaceDeclaration(node);
+            }
+
+            public override void VisitRecordDeclaration(RecordDeclarationSyntax node)
+            {
+                Types.Add(node);
+                base.VisitRecordDeclaration(node);
+            }
         }
-
-        nomes.Reverse();
-        return string.Join(".", nomes);
     }
 }
