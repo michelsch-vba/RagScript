@@ -28,6 +28,40 @@ namespace RagScript.Hooks
         private int _chaveIndex = 0;
         private readonly object _lockObject = new object();
 
+        /// <summary>
+        /// Carrega as chaves do disco silenciosamente sem exibir menus no Console.
+        /// </summary>
+        public async Task GarantirChavesCarregadasAsync()
+        {
+            lock (_lockObject)
+            {
+                // Se já existem chaves carregadas no pool, não re-lê o disco
+                if (_apiKeys.Count > 0) return;
+            }
+
+            string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
+            string arquivo = Path.Combine(pastaApp, "key.json");
+
+            if (System.IO.File.Exists(arquivo))
+            {
+                try
+                {
+                    string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
+                    var options = new JsonSerializerOptions { WriteIndented = true };
+                    var config = JsonSerializer.Deserialize<Options>(conteudo, options);
+
+                    if (config?.Keys != null && config.Keys.Count > 0)
+                    {
+                        CarregarChaves(config.Keys);
+                    }
+                }
+                catch
+                {
+                    // Tratamento silencioso caso o arquivo não exista ou esteja corrompido
+                }
+            }
+        }
+
         public void CarregarChaves(IEnumerable<string> chaves)
         {
             lock (_lockObject)
@@ -38,7 +72,7 @@ namespace RagScript.Hooks
             }
         }
 
-        private string? ObterProximaChaveValida()
+        internal string? ObterProximaChaveValida()
         {
             lock (_lockObject)
             {
@@ -67,7 +101,7 @@ namespace RagScript.Hooks
             }
         }
 
-        private void BloquearChave(string chave, TimeSpan tempo)
+        internal void BloquearChave(string chave, TimeSpan tempo)
         {
             lock (_lockObject)
             {
@@ -75,76 +109,7 @@ namespace RagScript.Hooks
             }
         }
 
-        public async Task<float[]> GerarEmbeddingHttpAsync(string texto)
-        {
-            int tentativamax = 5;
-
-            for (int tentativa = 1; tentativa <= tentativamax; tentativa++)
-            {
-                string? apiKey = ObterProximaChaveValida();
-
-                if (string.IsNullOrEmpty(apiKey))
-                {
-                    Console.WriteLine("\n⚠️ Todas as chaves do pool estão bloqueadas/temporariamente sem cota. Aguardando 15s...");
-                    await Task.Delay(15000);
-                    continue;
-                }
-
-                string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={apiKey}";
-                var payload = new
-                {
-                    content = new
-                    {
-                        parts = new[] { new { text = texto } }
-                    }
-                };
-
-                string jsonPayload = JsonSerializer.Serialize(payload);
-
-                try
-                {
-                    using var request = new HttpRequestMessage(HttpMethod.Post, url)
-                    {
-                        Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
-                    };
-
-                    using var response = await _httpClient.SendAsync(request);
-
-                    if ((int)response.StatusCode == 429)
-                    {
-                        Console.WriteLine($"\n⚠️ Rate Limit (429) na chave [{MascararKey(apiKey)}]. Ativando cooldown de 60s e alternando chave...");
-                        BloquearChave(apiKey, TimeSpan.FromSeconds(60));
-                        continue;
-                    }
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        string erroCorpo = await response.Content.ReadAsStringAsync();
-                        Console.WriteLine($"\n❌ Erro na API HTTP ({response.StatusCode}): {erroCorpo}");
-                        return Array.Empty<float>();
-                    }
-
-                    string jsonResponse = await response.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(jsonResponse);
-
-                    if (doc.RootElement.TryGetProperty("embedding", out var embeddingProp) &&
-                        embeddingProp.TryGetProperty("values", out var valuesProp))
-                    {
-                        return valuesProp.EnumerateArray()
-                            .Select(v => v.GetSingle())
-                            .ToArray();
-                    }
-
-                    return Array.Empty<float>();
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"\n❌ Exceção ao gerar embedding: {ex.Message}");
-                }
-            }
-
-            return Array.Empty<float>();
-        }
+        
 
         public async Task<List<string>> ObteroudarKeysAsync()
         {
@@ -153,7 +118,7 @@ namespace RagScript.Hooks
             Directory.CreateDirectory(pastaApp);
             string arquivo = Path.Combine(pastaApp, "key.json");
 
-            List<string> chavesCarregadas = new List<string>();
+            List<string> chavesCarregadas = new();
 
             if (System.IO.File.Exists(arquivo))
             {
@@ -169,7 +134,8 @@ namespace RagScript.Hooks
                             Console.WriteLine($"\n🔑 {chavesCarregadas.Count} chave(s) encontrada(s) no sistema:");
                             foreach (var k in chavesCarregadas)
                             {
-                                Console.WriteLine($" - {MascararKey(k)}");
+                                string TestandoChave = (TestarApiKeyAsync(k).Result == true) ? "✅ Válida" : "❌ Inválida";                            
+                                Console.WriteLine($" - {MascararKey(k)} - {TestandoChave}");
                             }
                             Console.WriteLine("---------------------------------------------");
                             Console.WriteLine("[1] Usar as chaves atuais");
@@ -189,7 +155,7 @@ namespace RagScript.Hooks
                     }
                     catch
                     {
-                        // Suporta transição caso o arquivo antigo contivesse apenas a string "key"
+                        // Suporta transição
                     }
                 }
             }
@@ -259,7 +225,7 @@ namespace RagScript.Hooks
             }
         }
 
-        private string MascararKey(string key)
+        internal string MascararKey(string key)
         {
             if (string.IsNullOrEmpty(key) || key.Length <= 8) return "****";
             return $"{key[..6]}...{key[^4..]}";
@@ -269,15 +235,12 @@ namespace RagScript.Hooks
     public class RagHook
     {
         private readonly ApiHook _apiHook;
+        private readonly HttpClient _httpClient;
 
         public RagHook()
         {
             _apiHook = new ApiHook();
-        }
-
-        public RagHook(ApiHook apiHook)
-        {
-            _apiHook = apiHook;
+            _httpClient = new HttpClient();
         }
 
         public async Task InicializarChavesAsync()
@@ -327,8 +290,22 @@ namespace RagScript.Hooks
 
         private IEnumerable<string> ObterArquivosValidos(string caminhoPasta)
         {
-            return Directory.EnumerateFiles(caminhoPasta, "*.*", SearchOption.AllDirectories)
-                .Where(arquivo => !CaminhoContemPastaIgnorada(arquivo.AsSpan()));
+            int tamanhoPrefixo = caminhoPasta.Length;
+            if (!caminhoPasta.EndsWith(Path.DirectorySeparatorChar) &&
+                !caminhoPasta.EndsWith(Path.AltDirectorySeparatorChar))
+            {
+                tamanhoPrefixo++;
+            }
+
+            foreach (var arquivo in Directory.EnumerateFiles(caminhoPasta, "*.*", SearchOption.AllDirectories))
+            {
+                ReadOnlySpan<char> caminhoRelativo = arquivo.AsSpan(Math.Min(tamanhoPrefixo, arquivo.Length));
+
+                if (!CaminhoContemPastaIgnorada(caminhoRelativo))
+                {
+                    yield return arquivo;
+                }
+            }
         }
 
         private static bool CaminhoContemPastaIgnorada(ReadOnlySpan<char> caminho)
@@ -469,12 +446,20 @@ namespace RagScript.Hooks
 
                     foreach (var chunk in pedacos)
                     {
-                        string textoParaEmbedding = $"[ARQUIVO: {caminhoRelativo}]\n" +
-                                                    $"[MEMBER/TIPO: {chunk.Tipo} -> {chunk.NomeMembro}]\n" +
-                                                    $"[ESTRUTURA/METADADOS: {metadadosExtraidos}]\n\n" +
-                                                    $"[CÓDIGO/CONTEÚDO]:\n{chunk.Conteudo}";
+                        // Constrói o cabeçalho de documentação apenas se existir documentação XML no chunk
+                        string docXml = string.IsNullOrWhiteSpace(chunk.DocumentacaoXml)
+                            ? string.Empty
+                            : $"[DOC XML]:\n{chunk.DocumentacaoXml}\n";
 
-                        Console.Write($"🔄 Vetorizando Chunk ({chunk.NomeMembro}) em {caminhoRelativo}... ");
+                        // Formatação rica incluindo HierarquiaCompleta e DocumentacaoXml de ChunkResult
+                        string textoParaEmbedding = $"[ARQUIVO: {caminhoRelativo}]\n" +
+                                                    $"[HIERARQUIA: {chunk.HierarquiaCompleta}]\n" +
+                                                    $"[TIPO/MEMBRO: {chunk.Tipo} -> {chunk.NomeMembro}]\n" +
+                                                    $"[ESTRUTURA/METADADOS: {metadadosExtraidos}]\n" +
+                                                    docXml +
+                                                    $"\n[CÓDIGO/CONTEÚDO]:\n{chunk.Conteudo}";
+
+                        Console.Write($"🔄 Vetorizando Chunk ({chunk.HierarquiaCompleta}) em {caminhoRelativo}... ");
 
                         // Loop de Resiliência: até 3 tentativas por chunk antes de descartar
                         float[] vectorValues = Array.Empty<float>();
@@ -483,7 +468,7 @@ namespace RagScript.Hooks
                         while (vectorValues.Length == 0 && tentativaChunk < 3)
                         {
                             tentativaChunk++;
-                            vectorValues = await _apiHook.GerarEmbeddingHttpAsync(textoParaEmbedding);
+                            vectorValues = await GerarEmbeddingHttpAsync(textoParaEmbedding);
 
                             if (vectorValues.Length == 0 && tentativaChunk < 3)
                             {
@@ -524,6 +509,80 @@ namespace RagScript.Hooks
             }
 
             return documentosVetoriais;
+        }
+
+        public async Task<float[]> GerarEmbeddingHttpAsync(string texto)
+        {
+            // 💡 Mudança Fundamental: Garante as chaves sem solicitar interação do usuário
+            await _apiHook.GarantirChavesCarregadasAsync();
+
+            int tentativamax = 5;
+
+            for (int tentativa = 1; tentativa <= tentativamax; tentativa++)
+            {
+                string? apiKey = _apiHook.ObterProximaChaveValida();
+
+                if (string.IsNullOrEmpty(apiKey))
+                {
+                    Console.WriteLine("\n⚠️ Todas as chaves do pool estão bloqueadas/temporariamente sem cota. Aguardando 15s...");
+                    await Task.Delay(15000);
+                    continue;
+                }
+
+                string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={apiKey}";
+                var payload = new
+                {
+                    content = new
+                    {
+                        parts = new[] { new { text = texto } }
+                    }
+                };
+
+                string jsonPayload = JsonSerializer.Serialize(payload);
+
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Post, url)
+                    {
+                        Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+                    };
+
+                    using var response = await _httpClient.SendAsync(request);
+
+                    if ((int)response.StatusCode == 429)
+                    {
+                        Console.WriteLine($"\n⚠️ Rate Limit (429) na chave [{_apiHook.MascararKey(apiKey)}]. Ativando cooldown de 60s e alternando chave...");
+                        _apiHook.BloquearChave(apiKey, TimeSpan.FromSeconds(60));
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string erroCorpo = await response.Content.ReadAsStringAsync();
+                        Console.WriteLine($"\n❌ Erro na API HTTP ({response.StatusCode}): {erroCorpo}");
+                        return Array.Empty<float>();
+                    }
+
+                    string jsonResponse = await response.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(jsonResponse);
+
+                    if (doc.RootElement.TryGetProperty("embedding", out var embeddingProp) &&
+                        embeddingProp.TryGetProperty("values", out var valuesProp))
+                    {
+                        return valuesProp.EnumerateArray()
+                            .Select(v => v.GetSingle())
+                            .ToArray();
+                    }
+
+                    return Array.Empty<float>();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"\n❌ Exceção ao gerar embedding: {ex.Message}");
+                }
+            }
+
+            return Array.Empty<float>();
         }
 
         private string GerarHashSHA256(string texto)
@@ -595,10 +654,18 @@ namespace RagScript.Hooks
     public class RagSearchHook
     {
         private readonly ApiHook _apiHook = new ApiHook();
+        private readonly RagHook _ragHook = new RagHook();
 
         public async Task InicializarChavesAsync()
         {
-            await _apiHook.ObteroudarKeysAsync();
+            // 💡 Garante que as chaves estão em memória sem abrir o menu do Console!
+            await _apiHook.GarantirChavesCarregadasAsync();
+        }
+
+        public async Task<float[]> GerarEmbeddingPerguntaAsync(string pergunta)
+        {
+            await InicializarChavesAsync();
+            return await _ragHook.GerarEmbeddingHttpAsync(pergunta);
         }
 
         public string GerarPerguntaEstruturada(
@@ -652,7 +719,7 @@ namespace RagScript.Hooks
                 case TipoPreset.DocumentacaoTecnica:
                     sb.AppendLine("Atue como um Technical Writer especializado em .NET. Responda seguindo a estrutura:");
                     sb.AppendLine("1. **Visão Geral:** Resumo do propósito funcional das classes/métodos citados.");
-                    sb.AppendLine("2. **Documentação XML Docs:** Forneça os comentários `<summary>`, `<param>` e `<returns>` prontos para colar sobre o código.");
+                    sb.AppendLine("2. **Código em bloco de código**: forneça o código da classe, metodo ou etc para ser visualizado melhor, sem xml docs somente comentarios se necessários");
                     sb.AppendLine("3. **Diagrama de Fluxo (Mermaid):** Exemplo visual básico do fluxo de execução, se aplicável.");
                     break;
 
@@ -741,18 +808,14 @@ namespace RagScript.Hooks
             return dotProduct / ((float)Math.Sqrt(normaA) * (float)Math.Sqrt(normaB));
         }
 
-        public async Task<float[]> GerarEmbeddingPerguntaAsync(string pergunta)
-        {
-            await InicializarChavesAsync();
-            return await _apiHook.GerarEmbeddingHttpAsync(pergunta);
-        }
     }
 
-    public class ChunkResult
+public class ChunkResult
     {
         public string Tipo { get; set; } = string.Empty;
         public string NomeMembro { get; set; } = string.Empty;
         public string HierarquiaCompleta { get; set; } = string.Empty;
+        public string DocumentacaoXml { get; set; } = string.Empty; // NOVO: Metadado extraído da AST
         public string Conteudo { get; set; } = string.Empty;
     }
 
@@ -761,7 +824,7 @@ namespace RagScript.Hooks
         public static List<ChunkResult> QuebrarCodigoCSharp(string codigo)
         {
             if (string.IsNullOrWhiteSpace(codigo))
-                return new List<ChunkResult>();
+                return new List<ChunkResult>(0);
 
             SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
             CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
@@ -769,10 +832,29 @@ namespace RagScript.Hooks
             var collector = new CSharpSyntaxCollector();
             collector.Visit(root);
 
-            var chunks = new List<ChunkResult>(collector.Methods.Count > 0 ? collector.Methods.Count : collector.Types.Count + 1);
+            int totalMembros = collector.Methods.Count + collector.Constructors.Count + collector.Properties.Count;
+            int totalElementos = totalMembros + collector.Types.Count;
 
-            if (collector.Methods.Count > 0)
+            if (totalElementos == 0)
             {
+                return new List<ChunkResult>(1)
+            {
+                new ChunkResult
+                {
+                    Tipo = "Arquivo/Estrutura",
+                    NomeMembro = "Geral",
+                    HierarquiaCompleta = "Geral",
+                    DocumentacaoXml = string.Empty,
+                    Conteudo = codigo
+                }
+            };
+            }
+
+            // PREFERÊNCIA 1: Granularidade fina (Membros)
+            if (totalMembros > 0)
+            {
+                var chunks = new List<ChunkResult>(totalMembros);
+
                 foreach (var method in collector.Methods)
                 {
                     chunks.Add(new ChunkResult
@@ -780,96 +862,173 @@ namespace RagScript.Hooks
                         Tipo = "Metodo",
                         NomeMembro = method.Identifier.Text,
                         HierarquiaCompleta = ObterCaminhoHierarquico(method),
+                        DocumentacaoXml = ExtrairSummaryXml(method),
                         Conteudo = method.ToFullString().Trim()
                     });
                 }
-                return chunks;
-            }
 
-            if (collector.Types.Count > 0)
-            {
-                foreach (var typeNode in collector.Types)
+                foreach (var ctor in collector.Constructors)
                 {
-                    ReadOnlySpan<char> kindName = typeNode.Kind().ToString().AsSpan();
-                    string tipoFormatado = kindName.EndsWith("Declaration")
-                        ? kindName.Slice(0, kindName.Length - "Declaration".Length).ToString()
-                        : kindName.ToString();
-
                     chunks.Add(new ChunkResult
                     {
-                        Tipo = tipoFormatado,
-                        NomeMembro = typeNode.Identifier.Text,
-                        HierarquiaCompleta = ObterCaminhoHierarquico(typeNode),
-                        Conteudo = typeNode.ToFullString().Trim()
+                        Tipo = "Construtor",
+                        NomeMembro = ctor.Identifier.Text,
+                        HierarquiaCompleta = ObterCaminhoHierarquico(ctor),
+                        DocumentacaoXml = ExtrairSummaryXml(ctor),
+                        Conteudo = ctor.ToFullString().Trim()
                     });
                 }
+
+                foreach (var prop in collector.Properties)
+                {
+                    chunks.Add(new ChunkResult
+                    {
+                        Tipo = "Propriedade",
+                        NomeMembro = prop.Identifier.Text,
+                        HierarquiaCompleta = ObterCaminhoHierarquico(prop),
+                        DocumentacaoXml = ExtrairSummaryXml(prop),
+                        Conteudo = prop.ToFullString().Trim()
+                    });
+                }
+
                 return chunks;
             }
 
-            chunks.Add(new ChunkResult
+            // PREFERÊNCIA 2: Granularidade estrutural (Tipos)
+            var typeChunks = new List<ChunkResult>(collector.Types.Count);
+            foreach (var typeNode in collector.Types)
             {
-                Tipo = "Arquivo/Estrutura",
-                NomeMembro = "Geral",
-                HierarquiaCompleta = "Geral",
-                Conteudo = codigo
-            });
+                typeChunks.Add(new ChunkResult
+                {
+                    Tipo = ObterNomeTipo(typeNode.Kind()),
+                    NomeMembro = typeNode.Identifier.Text,
+                    HierarquiaCompleta = ObterCaminhoHierarquico(typeNode),
+                    DocumentacaoXml = ExtrairSummaryXml(typeNode),
+                    Conteudo = typeNode.ToFullString().Trim()
+                });
+            }
 
-            return chunks;
+            return typeChunks;
+        }
+
+        private static string ExtrairSummaryXml(SyntaxNode node)
+        {
+            var docComment = node.GetLeadingTrivia()
+                .Select(t => t.GetStructure())
+                .OfType<DocumentationCommentTriviaSyntax>()
+                .FirstOrDefault();
+
+            if (docComment == null)
+                return string.Empty;
+
+            var summaryNode = docComment.Content
+                .OfType<XmlElementSyntax>()
+                .FirstOrDefault(e => e.StartTag.Name.ToString().Equals("summary", StringComparison.OrdinalIgnoreCase));
+
+            if (summaryNode == null)
+                return string.Empty;
+
+            // Limpa as barras /// e os espaços extras mantendo o texto interno
+            return summaryNode.Content.ToString()
+                .Replace("///", "")
+                .Trim();
         }
 
         private static string ObterCaminhoHierarquico(SyntaxNode node)
         {
-            var nomes = new List<string>(4);
-            var atual = node.Parent;
+            Span<int> boundaries = stackalloc int[8];
+            var ancestrais = new List<string>(4);
 
-            while (atual != null)
+            for (SyntaxNode? atual = node.Parent; atual != null; atual = atual.Parent)
             {
                 if (atual is BaseTypeDeclarationSyntax typeDecl)
-                    nomes.Add(typeDecl.Identifier.Text);
+                {
+                    ancestrais.Add(typeDecl.Identifier.Text);
+                }
                 else if (atual is BaseNamespaceDeclarationSyntax nsDecl)
-                    nomes.Add(nsDecl.Name.ToString());
-
-                atual = atual.Parent;
+                {
+                    ancestrais.Add(nsDecl.Name.ToString());
+                }
             }
 
-            nomes.Reverse();
-            return string.Join(".", nomes);
+            if (ancestrais.Count == 0) return string.Empty;
+            if (ancestrais.Count == 1) return ancestrais[0];
+
+            var sb = new StringBuilder(64);
+            for (int i = ancestrais.Count - 1; i >= 0; i--)
+            {
+                sb.Append(ancestrais[i]);
+                if (i > 0) sb.Append('.');
+            }
+
+            return sb.ToString();
         }
 
-        private sealed class CSharpSyntaxCollector : CSharpSyntaxWalker
+        private static string ObterNomeTipo(SyntaxKind kind) => kind switch
         {
-            public List<MethodDeclarationSyntax> Methods { get; } = new(16);
-            public List<BaseTypeDeclarationSyntax> Types { get; } = new(8);
+            SyntaxKind.ClassDeclaration => "Class",
+            SyntaxKind.StructDeclaration => "Struct",
+            SyntaxKind.InterfaceDeclaration => "Interface",
+            SyntaxKind.EnumDeclaration => "Enum",
+            SyntaxKind.RecordDeclaration => "Record",
+            SyntaxKind.RecordStructDeclaration => "RecordStruct",
+            _ => "Type"
+        };
+    }
 
-            public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
-            {
-                Methods.Add(node);
-                base.VisitMethodDeclaration(node);
-            }
+    internal class CSharpSyntaxCollector : CSharpSyntaxWalker
+    {
+        public List<MethodDeclarationSyntax> Methods { get; } = new();
+        public List<BaseTypeDeclarationSyntax> Types { get; } = new();
+        public List<PropertyDeclarationSyntax> Properties { get; } = new();
+        public List<ConstructorDeclarationSyntax> Constructors { get; } = new();
 
-            public override void VisitClassDeclaration(ClassDeclarationSyntax node)
-            {
-                Types.Add(node);
-                base.VisitClassDeclaration(node);
-            }
+        public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
+        {
+            Methods.Add(node);
+            base.VisitMethodDeclaration(node);
+        }
 
-            public override void VisitStructDeclaration(StructDeclarationSyntax node)
-            {
-                Types.Add(node);
-                base.VisitStructDeclaration(node);
-            }
+        public override void VisitPropertyDeclaration(PropertyDeclarationSyntax node)
+        {
+            Properties.Add(node);
+            base.VisitPropertyDeclaration(node);
+        }
 
-            public override void VisitInterfaceDeclaration(InterfaceDeclarationSyntax node)
-            {
-                Types.Add(node);
-                base.VisitInterfaceDeclaration(node);
-            }
+        public override void VisitConstructorDeclaration(ConstructorDeclarationSyntax node)
+        {
+            Constructors.Add(node);
+            base.VisitConstructorDeclaration(node);
+        }
 
-            public override void VisitRecordDeclaration(RecordDeclarationSyntax node)
-            {
-                Types.Add(node);
-                base.VisitRecordDeclaration(node);
-            }
+        public override void VisitClassDeclaration(ClassDeclarationSyntax node)
+        {
+            Types.Add(node);
+            base.VisitClassDeclaration(node);
+        }
+
+        public override void VisitStructDeclaration(StructDeclarationSyntax node)
+        {
+            Types.Add(node);
+            base.VisitStructDeclaration(node);
+        }
+
+        public override void VisitInterfaceDeclaration(InterfaceDeclarationSyntax node)
+        {
+            Types.Add(node);
+            base.VisitInterfaceDeclaration(node);
+        }
+
+        public override void VisitRecordDeclaration(RecordDeclarationSyntax node)
+        {
+            Types.Add(node);
+            base.VisitRecordDeclaration(node);
+        }
+
+        public override void VisitEnumDeclaration(EnumDeclarationSyntax node)
+        {
+            Types.Add(node);
+            base.VisitEnumDeclaration(node);
         }
     }
 }

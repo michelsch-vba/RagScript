@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 
@@ -18,6 +19,7 @@ namespace FreeRag.IndexerConsole
         [STAThread]
         static async Task Main(string[] args)
         {
+            Console.OutputEncoding = Encoding.UTF8;
             Console.Title = "Gerador de RAG com Gemini - FreeRag";
 
             bool executando = true;

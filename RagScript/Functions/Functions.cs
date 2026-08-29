@@ -55,7 +55,7 @@ namespace RagScript.Funções
 
             Console.WriteLine($"📌 Pasta selecionada: {pastaOrigem}");
 
-            var extensoesEscolhidas = ragHook.SelecionarExtensoes(pastaOrigem);
+            List<string> extensoesEscolhidas = ragHook.SelecionarExtensoes(pastaOrigem);
 
             if (!extensoesEscolhidas.Any())
             {
