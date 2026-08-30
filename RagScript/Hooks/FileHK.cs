@@ -7,6 +7,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using RagScript.Models;
 using System;
 using System.Collections.Generic;
+using System.Drawing.Text;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -109,9 +110,9 @@ namespace RagScript.Hooks
             }
         }
 
-        
 
-        public async Task<List<string>> ObteroudarKeysAsync()
+
+        public async Task<List<string>?> ObteroudarKeysAsync()
         {
             JsonSerializerOptions options = new JsonSerializerOptions { WriteIndented = true };
             string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
@@ -128,15 +129,18 @@ namespace RagScript.Hooks
                     try
                     {
                         var config = JsonSerializer.Deserialize<Options>(conteudo, options);
+                        
                         if (config?.Keys != null && config.Keys.Count > 0)
                         {
                             chavesCarregadas = config.Keys;
                             Console.WriteLine($"\n🔑 {chavesCarregadas.Count} chave(s) encontrada(s) no sistema:");
+                            
                             foreach (var k in chavesCarregadas)
                             {
-                                string TestandoChave = (TestarApiKeyAsync(k).Result == true) ? "✅ Válida" : "❌ Inválida";                            
+                                string TestandoChave = (TestarApiKeyAsync(k).Result == true) ? "✅ Válida" : "❌ Inválida";
                                 Console.WriteLine($" - {MascararKey(k)} - {TestandoChave}");
                             }
+
                             Console.WriteLine("---------------------------------------------");
                             Console.WriteLine("[1] Usar as chaves atuais");
                             Console.WriteLine("[2] Cadastrar novo grupo de chaves");
@@ -149,66 +153,291 @@ namespace RagScript.Hooks
                             {
                                 CarregarChaves(chavesCarregadas);
                                 return chavesCarregadas;
+
                             }
-                            if (opcao == "3") return new List<string>();
+                            else if (opcao == "2")
+                            {
+                                var novasChaves = await CadastrarNovasChaves(chavesCarregadas);
+                                if (novasChaves?.Any() == true)
+                                {
+                                    CarregarChaves(novasChaves);
+                                    return novasChaves;
+                                }
+                            }
+                            else if (opcao == "3")
+                            {
+                                Console.WriteLine("Voltando ao menu anterior...");
+                                return chavesCarregadas;
+                            }
+                            else
+                            {
+                                Console.WriteLine("Operação cancelada. Mantendo as chaves atuais.");
+                                return chavesCarregadas;
+                            }
+
                         }
+                        else
+                        {
+                            Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
+                            var listanova = await NovasChaves(obrigatorio: true);
+
+                        }
+
                     }
-                    catch
-                    {
-                        // Suporta transição
+                    
+                    catch (Exception ex) 
+                    { 
+                        Console.WriteLine(ex.ToString()); 
                     }
                 }
+                
+                else
+                {
+                    Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
+                    chavesCarregadas = await NovasChaves(obrigatorio: true);
+
+                }
+
             }
 
-            List<string> novasChaves = new List<string>();
-            Console.WriteLine("\n⚠️ Cadastre as API Keys do Gemini. Digite 'fim' para concluir ou 'sair' para cancelar.");
+            else
+            {
+                Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
+                chavesCarregadas = await NovasChaves(obrigatorio: true);
+            }
+
+            return chavesCarregadas;
+        }
+                
+                    
+         private async Task<List<string>?> CadastrarNovasChaves(List<string> lista)
+        {
+            List<string> Chaves = new();
+            Console.WriteLine("\n Escolha uma das opções:");
+            Console.WriteLine("[1] cadastrar uma lista nova de chaves");
+            Console.WriteLine("[2] mudar chave ");
+            Console.WriteLine("[3] deletar chave");
+            Console.WriteLine("[4] Deletar uma chave inválida da lista");
 
             while (true)
             {
-                Console.Write($"Digite a API Key #{novasChaves.Count + 1}: ");
-                string input = Console.ReadLine()?.Trim() ?? string.Empty;
+                Console.Write("Escolha uma opção: ");
 
-                if (input.Equals("sair", StringComparison.OrdinalIgnoreCase)) return new List<string>();
-                if (input.Equals("fim", StringComparison.OrdinalIgnoreCase))
+                string opcao = Console.ReadLine()?.Trim() ?? string.Empty;
+
+                if (opcao == "1")
                 {
-                    if (novasChaves.Count > 0) break;
-                    Console.WriteLine("❌ Insira ao menos uma chave válida antes de finalizar.");
-                    continue;
+                    var novasChaves = await NovasChaves();
+                    
+                    if(!novasChaves.Any())
+                    {
+                        Console.WriteLine("Nenhuma nova chave cadastrada, chaves atuais mantidas");
+                        continue;
+                    }
+
+                    return novasChaves;
                 }
 
-                if (string.IsNullOrWhiteSpace(input))
+                if (opcao == "2")
                 {
-                    Console.WriteLine("❌ A chave não pode ser vazia.");
-                    continue;
+                    return await MudarChaves(lista);
                 }
 
-                bool valida = await TestarApiKeyAsync(input);
-                if (valida)
+                if (opcao == "3")
                 {
-                    novasChaves.Add(input);
-                    Console.WriteLine("✅ Chave validada e adicionada ao pool!");
+                    return await DeletarChave(lista);
                 }
             }
 
-            if (novasChaves.Count > 0)
+        }
+        
+        private async Task<List<string>> NovasChaves(bool obrigatorio = false)
+        {
+            List<string>? novaschaves = new();
+            int numerodechaves = 1;
+            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
+
+            Console.WriteLine("---------------------------------------");
+            Console.WriteLine("Digite a chave de API, ou digite 'sair' para sair da operação, e terminando a lista digite 'fim'");            
+
+            while (true)
             {
-                try
+                Console.Write($"Digite a {numerodechaves}º chave: ");
+                String output = Console.ReadLine()?.Trim() ?? String.Empty;
+
+                if(output == "fim" && novaschaves.Count <= 0)
                 {
-                    Options novoOptions = new Options(novasChaves);
-                    string jsonParaSalvar = JsonSerializer.Serialize(novoOptions, options);
-                    System.IO.File.WriteAllText(arquivo, jsonParaSalvar);
-                    Console.WriteLine($"✅ {novasChaves.Count} chave(s) salvas em: {arquivo}");
-                    CarregarChaves(novasChaves);
+                    Console.WriteLine("Cadastre pelo menos uma chave valida ou digite 'Sair para encerrar a operação");
+                    continue;
                 }
-                catch (Exception ex)
+                else if (output == "fim" && novaschaves.Count > 0)
                 {
-                    Console.WriteLine($"⚠️ Chaves válidas, mas erro ao salvar arquivo: {ex.Message}");
+                    break;
                 }
+
+                if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
+                {
+
+                    if(obrigatorio == true)
+                    {
+                        Console.WriteLine("Cadastre pelo menos uma chave válida para uso, e digite 'fim' para terminar o cadastro");
+                        continue;
+                    }
+
+                    Console.WriteLine("Encerrando o cadastro...");
+                    novaschaves.Clear();
+                    break;
+                }
+
+                if (string.IsNullOrEmpty(output))
+                {
+                    Console.WriteLine("\n Escreva uma chave válida ou digite sair");
+                    continue;
+                }
+
+                if(!await TestarApiKeyAsync(output))
+                {
+                    Console.WriteLine("\nDigite uma chave de API válida e do Gemini");
+                    continue;
+                }
+
+                numerodechaves++;
+                novaschaves.Add(output);
+            }      
+            return novaschaves;
+        }
+        
+        private async Task<List<string>> MudarChaves(List<string> lista)
+        {
+            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
+
+            if(!lista.Any())
+            {
+                Console.WriteLine("Nenhuma chave na lista, redirecionaremos para cadastrar novas chaves");
+                var novasChaves = await NovasChaves(obrigatorio: true);
+                return novasChaves;
             }
 
-            return novasChaves;
+            foreach (var item in lista)
+            {
+                Console.WriteLine($"Chave da API e posição '{MascararKey(item)}': {lista.IndexOf(item) + 1} - {((TestarApiKeyAsync(item).Result == true) ? "✅ Válida" : "❌ Inválida")}");
+            }
+
+            while (true)
+            {
+                Console.Write("Digite o número da chave que deseja mudar, ou sair para encerrar a operação: ");
+
+                string output = Console.ReadLine()?.Trim() ?? String.Empty;
+
+                //operação para sair
+                if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("Encerrando a operação...");
+                    break;
+                }
+
+                //operação de mudança + validação
+                if (int.TryParse(output, out int index) && index > 0 && index <= lista.Count)
+                {
+                    Console.Write("Digite a nova chave de API: ");
+                    string novaChave = Console.ReadLine()?.Trim() ?? String.Empty;
+                    if (!string.IsNullOrEmpty(novaChave) && TestarApiKeyAsync(novaChave).Result)
+                    {
+                        lista[index - 1] = novaChave;                    
+                        Console.WriteLine($"Chave na posição {index} alterada com sucesso.");
+                        return await VerificarArquivo(chaves: lista, outvalor: true);
+
+                    }
+                    else
+                    {
+                        Console.WriteLine("Chave inválida. Operação cancelada.");
+                        continue;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Índice inválido. Operação cancelada.");
+                    continue;
+                }
+
+            }
+
+            return null;
         }
 
+        private async Task<List<string>?> DeletarChave (List<string> lista)
+        {
+            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
+
+            if (!lista.Any())
+            {
+                Console.WriteLine("Nenhuma chave na lista, redirecionaremos para cadastrar novas chaves");
+                var novasChaves = await NovasChaves(obrigatorio: true);
+                return novasChaves;
+            }
+
+            Console.WriteLine("--------------------------------------------");
+            
+            foreach (var item in lista)
+            {
+                Console.WriteLine($"Chave da API e posição '{MascararKey(item)}': {lista.IndexOf(item) + 1} - {((TestarApiKeyAsync(item).Result == true) ? "✅ Válida" : "❌ Inválida")}");
+            }
+
+            while (true)
+            {
+                Console.Write("Digite o número da chave que quer deletar, ou sair para encerrar");
+
+                String output = Console.ReadLine()?.Trim() ?? String.Empty;
+
+                if(string.IsNullOrEmpty(output))
+                {
+                    Console.WriteLine("digite uma posição ou digite sair para sair");
+                    continue;
+                }
+
+                if(comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("encerrando a operação...");
+                    break;
+                }
+
+                if(int.TryParse(output, out int valor) && valor - 1 >= 0 && valor - 1 <= lista.Count)
+                {
+                    lista.RemoveAt(valor - 1);
+                    return await VerificarArquivo(chaves: lista, outvalor: true);
+                }
+
+            }
+            return null;
+
+        }
+
+       
+
+        private async Task<List<string>?> VerificarArquivo(bool outvalor = false, List<string>? chaves = null)
+        {
+            List<string> lista = new();
+            var options = new JsonSerializerOptions { WriteIndented = true };
+
+            string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
+            string arquivo = Path.Combine(pastaApp, "key.json");
+
+            Directory.CreateDirectory(pastaApp);
+
+            if (System.IO.File.Exists(arquivo) && outvalor == true)
+            {
+                string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
+                var config = JsonSerializer.Deserialize<Options>(conteudo, options);
+            }
+
+            if(chaves?.Any() == true)
+            { 
+               var conteudo = JsonSerializer.Serialize(chaves, options);
+               await System.IO.File.WriteAllTextAsync(arquivo, conteudo);
+            }
+
+            return null;
+        }
         public async Task<bool> TestarApiKeyAsync(string apiKey)
         {
             if (string.IsNullOrWhiteSpace(apiKey)) return false;
