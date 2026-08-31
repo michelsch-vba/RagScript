@@ -16,7 +16,7 @@ namespace RagScript.Funções
         public static async Task<List<string>> GerenciarApiKeyAsync()
         {
             ApiHook apiHook = new ApiHook();
-            List<string> keys = await apiHook.ObteroudarKeysAsync();
+            List<string>? keys = await apiHook.ObteroudarKeysAsync();
 
             if (keys == null || !keys.Any())
             {

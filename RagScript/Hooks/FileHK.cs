@@ -4,6 +4,7 @@ using Google.GenAI.Types;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using RagScript.Hooks;
 using RagScript.Models;
 using System;
 using System.Collections.Generic;
@@ -14,13 +15,20 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using static RagScript.Hooks.CodeChunker;
 
 namespace RagScript.Hooks
 {
+    public class Options
+    {
+        public List<string> Keys { get; set; } = new();
+    }
+
     public class ApiHook
     {
         private readonly HttpClient _httpClient = new HttpClient();
@@ -29,14 +37,10 @@ namespace RagScript.Hooks
         private int _chaveIndex = 0;
         private readonly object _lockObject = new object();
 
-        /// <summary>
-        /// Carrega as chaves do disco silenciosamente sem exibir menus no Console.
-        /// </summary>
         public async Task GarantirChavesCarregadasAsync()
         {
             lock (_lockObject)
             {
-                // Se já existem chaves carregadas no pool, não re-lê o disco
                 if (_apiKeys.Count > 0) return;
             }
 
@@ -58,7 +62,7 @@ namespace RagScript.Hooks
                 }
                 catch
                 {
-                    // Tratamento silencioso caso o arquivo não exista ou esteja corrompido
+                    // Silencioso em falhas de leitura
                 }
             }
         }
@@ -110,11 +114,9 @@ namespace RagScript.Hooks
             }
         }
 
-
-
         public async Task<List<string>?> ObteroudarKeysAsync()
         {
-            JsonSerializerOptions options = new JsonSerializerOptions { WriteIndented = true };
+            var options = new JsonSerializerOptions { WriteIndented = true };
             string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
             Directory.CreateDirectory(pastaApp);
             string arquivo = Path.Combine(pastaApp, "key.json");
@@ -123,27 +125,28 @@ namespace RagScript.Hooks
 
             if (System.IO.File.Exists(arquivo))
             {
-                string conteudo = System.IO.File.ReadAllText(arquivo);
-                if (!string.IsNullOrWhiteSpace(conteudo))
+                try
                 {
-                    try
+                    string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
+                    if (!string.IsNullOrWhiteSpace(conteudo))
                     {
                         var config = JsonSerializer.Deserialize<Options>(conteudo, options);
-                        
+
                         if (config?.Keys != null && config.Keys.Count > 0)
                         {
                             chavesCarregadas = config.Keys;
                             Console.WriteLine($"\n🔑 {chavesCarregadas.Count} chave(s) encontrada(s) no sistema:");
-                            
+
                             foreach (var k in chavesCarregadas)
                             {
-                                string TestandoChave = (TestarApiKeyAsync(k).Result == true) ? "✅ Válida" : "❌ Inválida";
-                                Console.WriteLine($" - {MascararKey(k)} - {TestandoChave}");
+                                bool eValida = await TestarApiKeyAsync(k);
+                                string status = eValida ? "✅ Válida" : "❌ Inválida";
+                                Console.WriteLine($" - {MascararKey(k)} - {status}");
                             }
 
                             Console.WriteLine("---------------------------------------------");
                             Console.WriteLine("[1] Usar as chaves atuais");
-                            Console.WriteLine("[2] Cadastrar novo grupo de chaves");
+                            Console.WriteLine("[2] Gerenciar/Cadastrar chaves");
                             Console.WriteLine("[3] Voltar");
                             Console.Write("Escolha uma opção: ");
 
@@ -153,7 +156,6 @@ namespace RagScript.Hooks
                             {
                                 CarregarChaves(chavesCarregadas);
                                 return chavesCarregadas;
-
                             }
                             else if (opcao == "2")
                             {
@@ -164,280 +166,252 @@ namespace RagScript.Hooks
                                     return novasChaves;
                                 }
                             }
-                            else if (opcao == "3")
-                            {
-                                Console.WriteLine("Voltando ao menu anterior...");
-                                return chavesCarregadas;
-                            }
                             else
                             {
-                                Console.WriteLine("Operação cancelada. Mantendo as chaves atuais.");
+                                Console.WriteLine("Mantendo o fluxo sem alterações nas chaves.");
                                 return chavesCarregadas;
                             }
-
                         }
-                        else
-                        {
-                            Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
-                            var listanova = await NovasChaves(obrigatorio: true);
-
-                        }
-
-                    }
-                    
-                    catch (Exception ex) 
-                    { 
-                        Console.WriteLine(ex.ToString()); 
                     }
                 }
-                
-                else
+                catch (Exception ex)
                 {
-                    Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
-                    chavesCarregadas = await NovasChaves(obrigatorio: true);
-
+                    Console.WriteLine($"Erro ao ler configurações: {ex.Message}");
                 }
-
             }
 
-            else
-            {
-                Console.WriteLine("Nenhuma lista de chaves encontrada. Por favor, cadastre uma nova lista.");
-                chavesCarregadas = await NovasChaves(obrigatorio: true);
-            }
+            Console.WriteLine("\nNenhuma chave configurada. É necessário cadastrar pelo menos uma.");
+            chavesCarregadas = await NovasChaves(obrigatorio: true);
+            CarregarChaves(chavesCarregadas);
+            await SalvarChavesEmArquivoAsync(chavesCarregadas);
 
             return chavesCarregadas;
         }
-                
-                    
-         private async Task<List<string>?> CadastrarNovasChaves(List<string> lista)
+
+        private async Task<List<string>?> CadastrarNovasChaves(List<string> listaAtual)
         {
-            List<string> Chaves = new();
-            Console.WriteLine("\n Escolha uma das opções:");
-            Console.WriteLine("[1] cadastrar uma lista nova de chaves");
-            Console.WriteLine("[2] mudar chave ");
-            Console.WriteLine("[3] deletar chave");
-            Console.WriteLine("[4] Deletar uma chave inválida da lista");
+            Console.WriteLine("------------------------------------------------------");
+            Console.WriteLine("\nEscolha uma das opções:");
+            Console.WriteLine("[1] Cadastrar uma lista nova de chaves (Sobrescrever)");
+            Console.WriteLine("[2] Mudar/Substituir uma chave específica");
+            Console.WriteLine("[3] Deletar uma chave específica");
+            Console.WriteLine("[4] Limpar todas as chaves inválidas automaticamente");
 
             while (true)
             {
-                Console.Write("Escolha uma opção: ");
-
+                Console.Write("\nEscolha uma opção: ");
                 string opcao = Console.ReadLine()?.Trim() ?? string.Empty;
 
                 if (opcao == "1")
                 {
                     var novasChaves = await NovasChaves();
-                    
-                    if(!novasChaves.Any())
+                    if (!novasChaves.Any())
                     {
-                        Console.WriteLine("Nenhuma nova chave cadastrada, chaves atuais mantidas");
-                        continue;
+                        Console.WriteLine("Nenhuma nova chave cadastrada. Operação cancelada.");
+                        return listaAtual;
                     }
-
+                    await SalvarChavesEmArquivoAsync(novasChaves);
                     return novasChaves;
                 }
-
-                if (opcao == "2")
+                else if (opcao == "2")
                 {
-                    return await MudarChaves(lista);
+                    return await MudarChaves(listaAtual);
                 }
-
-                if (opcao == "3")
+                else if (opcao == "3")
                 {
-                    return await DeletarChave(lista);
+                    return await DeletarChave(listaAtual);
+                }
+                else if (opcao == "4")
+                {
+                    return await DeletarChavesInvalidasAsync(listaAtual);
+                }
+                else
+                {
+                    Console.WriteLine("Opção inválida.");
                 }
             }
-
         }
-        
+
         private async Task<List<string>> NovasChaves(bool obrigatorio = false)
         {
-            List<string>? novaschaves = new();
-            int numerodechaves = 1;
+            List<string> novasChaves = new();
+            int numeroDeChaves = 1;
             string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
 
             Console.WriteLine("---------------------------------------");
-            Console.WriteLine("Digite a chave de API, ou digite 'sair' para sair da operação, e terminando a lista digite 'fim'");            
+            Console.WriteLine("Digite a chave de API. Ao terminar, digite 'fim'. (Ou 'sair' para cancelar)\n");
 
             while (true)
             {
-                Console.Write($"Digite a {numerodechaves}º chave: ");
-                String output = Console.ReadLine()?.Trim() ?? String.Empty;
+                Console.Write($"Digite a {numeroDeChaves}ª chave: ");
+                string output = Console.ReadLine()?.Trim() ?? string.Empty;
 
-                if(output == "fim" && novaschaves.Count <= 0)
+                if (output.Equals("fim", StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine("Cadastre pelo menos uma chave valida ou digite 'Sair para encerrar a operação");
-                    continue;
-                }
-                else if (output == "fim" && novaschaves.Count > 0)
-                {
+                    if (novasChaves.Count == 0)
+                    {
+                        Console.WriteLine("Cadastre pelo menos uma chave válida ou digite 'sair'.");
+                        continue;
+                    }
                     break;
                 }
 
                 if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
                 {
-
-                    if(obrigatorio == true)
+                    if (obrigatorio && novasChaves.Count == 0)
                     {
-                        Console.WriteLine("Cadastre pelo menos uma chave válida para uso, e digite 'fim' para terminar o cadastro");
+                        Console.WriteLine("O cadastro de ao menos uma chave é obrigatório.");
                         continue;
                     }
-
-                    Console.WriteLine("Encerrando o cadastro...");
-                    novaschaves.Clear();
+                    novasChaves.Clear();
                     break;
                 }
 
                 if (string.IsNullOrEmpty(output))
                 {
-                    Console.WriteLine("\n Escreva uma chave válida ou digite sair");
+                    Console.WriteLine("Entrada inválida.");
                     continue;
                 }
 
-                if(!await TestarApiKeyAsync(output))
+                Console.WriteLine("Testando chave...");
+                if (!await TestarApiKeyAsync(output))
                 {
-                    Console.WriteLine("\nDigite uma chave de API válida e do Gemini");
+                    Console.WriteLine("❌ Chave inválida ou sem conexão com a API do Gemini. Tente novamente.");
                     continue;
                 }
 
-                numerodechaves++;
-                novaschaves.Add(output);
-            }      
-            return novaschaves;
+                Console.WriteLine("✅ Chave válida adicionada!");
+                novasChaves.Add(output);
+                numeroDeChaves++;
+            }
+
+            return novasChaves;
         }
-        
+
         private async Task<List<string>> MudarChaves(List<string> lista)
-        {
-            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
-
-            if(!lista.Any())
-            {
-                Console.WriteLine("Nenhuma chave na lista, redirecionaremos para cadastrar novas chaves");
-                var novasChaves = await NovasChaves(obrigatorio: true);
-                return novasChaves;
-            }
-
-            foreach (var item in lista)
-            {
-                Console.WriteLine($"Chave da API e posição '{MascararKey(item)}': {lista.IndexOf(item) + 1} - {((TestarApiKeyAsync(item).Result == true) ? "✅ Válida" : "❌ Inválida")}");
-            }
-
-            while (true)
-            {
-                Console.Write("Digite o número da chave que deseja mudar, ou sair para encerrar a operação: ");
-
-                string output = Console.ReadLine()?.Trim() ?? String.Empty;
-
-                //operação para sair
-                if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine("Encerrando a operação...");
-                    break;
-                }
-
-                //operação de mudança + validação
-                if (int.TryParse(output, out int index) && index > 0 && index <= lista.Count)
-                {
-                    Console.Write("Digite a nova chave de API: ");
-                    string novaChave = Console.ReadLine()?.Trim() ?? String.Empty;
-                    if (!string.IsNullOrEmpty(novaChave) && TestarApiKeyAsync(novaChave).Result)
-                    {
-                        lista[index - 1] = novaChave;                    
-                        Console.WriteLine($"Chave na posição {index} alterada com sucesso.");
-                        return await VerificarArquivo(chaves: lista, outvalor: true);
-
-                    }
-                    else
-                    {
-                        Console.WriteLine("Chave inválida. Operação cancelada.");
-                        continue;
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("Índice inválido. Operação cancelada.");
-                    continue;
-                }
-
-            }
-
-            return null;
-        }
-
-        private async Task<List<string>?> DeletarChave (List<string> lista)
         {
             string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
 
             if (!lista.Any())
             {
-                Console.WriteLine("Nenhuma chave na lista, redirecionaremos para cadastrar novas chaves");
-                var novasChaves = await NovasChaves(obrigatorio: true);
-                return novasChaves;
+                Console.WriteLine("Nenhuma chave cadastrada para alterar.");
+                return await NovasChaves(obrigatorio: true);
             }
 
-            Console.WriteLine("--------------------------------------------");
-            
-            foreach (var item in lista)
-            {
-                Console.WriteLine($"Chave da API e posição '{MascararKey(item)}': {lista.IndexOf(item) + 1} - {((TestarApiKeyAsync(item).Result == true) ? "✅ Válida" : "❌ Inválida")}");
-            }
+            await ExibirStatusChavesAsync(lista);
 
             while (true)
             {
-                Console.Write("Digite o número da chave que quer deletar, ou sair para encerrar");
+                Console.Write("\nDigite o número da chave que deseja alterar (ou 'sair'): ");
+                string output = Console.ReadLine()?.Trim() ?? string.Empty;
 
-                String output = Console.ReadLine()?.Trim() ?? String.Empty;
-
-                if(string.IsNullOrEmpty(output))
-                {
-                    Console.WriteLine("digite uma posição ou digite sair para sair");
-                    continue;
-                }
-
-                if(comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine("encerrando a operação...");
+                if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
                     break;
-                }
 
-                if(int.TryParse(output, out int valor) && valor - 1 >= 0 && valor - 1 <= lista.Count)
+                if (int.TryParse(output, out int index) && index > 0 && index <= lista.Count)
                 {
-                    lista.RemoveAt(valor - 1);
-                    return await VerificarArquivo(chaves: lista, outvalor: true);
+                    Console.Write("Digite a nova chave de API: ");
+                    string novaChave = Console.ReadLine()?.Trim() ?? string.Empty;
+
+                    if (!string.IsNullOrEmpty(novaChave) && await TestarApiKeyAsync(novaChave))
+                    {
+                        lista[index - 1] = novaChave;
+                        Console.WriteLine($"✅ Chave na posição {index} alterada com sucesso.");
+                        await SalvarChavesEmArquivoAsync(lista);
+                        return lista;
+                    }
+
+                    Console.WriteLine("❌ Chave digitada é inválida.");
                 }
-
+                else
+                {
+                    Console.WriteLine("Posição inválida.");
+                }
             }
-            return null;
 
+            return lista;
         }
 
-       
-
-        private async Task<List<string>?> VerificarArquivo(bool outvalor = false, List<string>? chaves = null)
+        private async Task<List<string>> DeletarChave(List<string> lista)
         {
-            List<string> lista = new();
-            var options = new JsonSerializerOptions { WriteIndented = true };
+            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
 
+            if (!lista.Any())
+            {
+                Console.WriteLine("Nenhuma chave na lista para remover.");
+                return lista;
+            }
+
+            await ExibirStatusChavesAsync(lista);
+
+            while (true)
+            {
+                Console.Write("\nDigite o número da chave que deseja deletar (ou 'sair'): ");
+                string output = Console.ReadLine()?.Trim() ?? string.Empty;
+
+                if (comandosSair.Contains(output, StringComparer.OrdinalIgnoreCase))
+                    break;
+
+                if (int.TryParse(output, out int index) && index > 0 && index <= lista.Count)
+                {
+                    lista.RemoveAt(index - 1);
+                    Console.WriteLine($"✅ Chave removida com sucesso.");
+                    await SalvarChavesEmArquivoAsync(lista);
+                    return lista;
+                }
+
+                Console.WriteLine("Posição inválida.");
+            }
+
+            return lista;
+        }
+
+        private async Task<List<string>> DeletarChavesInvalidasAsync(List<string> lista)
+        {
+            Console.WriteLine("\nVerificando e removendo chaves inválidas...");
+            List<string> chavesValidas = new();
+
+            foreach (var key in lista)
+            {
+                if (await TestarApiKeyAsync(key))
+                {
+                    chavesValidas.Add(key);
+                }
+                else
+                {
+                    Console.WriteLine($"❌ Chave removida por ser inválida: {MascararKey(key)}");
+                }
+            }
+
+            await SalvarChavesEmArquivoAsync(chavesValidas);
+            return chavesValidas;
+        }
+
+        private async Task ExibirStatusChavesAsync(List<string> lista)
+        {
+            Console.WriteLine("\n--- Status das Chaves ---");
+            for (int i = 0; i < lista.Count; i++)
+            {
+                bool eValida = await TestarApiKeyAsync(lista[i]);
+                string status = eValida ? "✅ Válida" : "❌ Inválida";
+                Console.WriteLine($"[{i + 1}] {MascararKey(lista[i])} - {status}");
+            }
+        }
+
+        private async Task SalvarChavesEmArquivoAsync(List<string> chaves)
+        {
             string pastaApp = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "RagKey");
             string arquivo = Path.Combine(pastaApp, "key.json");
 
             Directory.CreateDirectory(pastaApp);
 
-            if (System.IO.File.Exists(arquivo) && outvalor == true)
-            {
-                string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
-                var config = JsonSerializer.Deserialize<Options>(conteudo, options);
-            }
+            var config = new Options { Keys = chaves };
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            string conteudo = JsonSerializer.Serialize(config, options);
 
-            if(chaves?.Any() == true)
-            { 
-               var conteudo = JsonSerializer.Serialize(chaves, options);
-               await System.IO.File.WriteAllTextAsync(arquivo, conteudo);
-            }
-
-            return null;
+            await System.IO.File.WriteAllTextAsync(arquivo, conteudo);
         }
+
         public async Task<bool> TestarApiKeyAsync(string apiKey)
         {
             if (string.IsNullOrWhiteSpace(apiKey)) return false;
@@ -667,11 +641,27 @@ namespace RagScript.Hooks
 
                     string caminhoRelativo = Path.GetRelativePath(caminhoPasta, arquivo);
                     string hash = GerarHashSHA256(conteudo);
-                    string metadadosExtraidos = (ext == ".cs") ? ExtrairEstruturaCSharp(conteudo) : $"Arquivo {ext}";
-
-                    var pedacos = (ext == ".cs")
-                        ? CodeChunker.QuebrarCodigoCSharp(conteudo)
-                        : new List<ChunkResult> { new ChunkResult { Tipo = "Documento", NomeMembro = Path.GetFileName(arquivo), Conteudo = conteudo } };
+                    string metadadosExtraidos = ext switch
+                    {
+                        ".cs" => ExtrairEstruturaCSharp(conteudo),
+                        ".xaml" => ExtrairEstruturaXaml(conteudo),
+                        _ => $"Arquivo {ext}"
+                    };
+                    
+                    var pedacos = ext switch
+                    {
+                        ".cs" => CodeChunker.QuebrarCodigoCSharp(conteudo),
+                        ".xaml" => XamlChunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        _ => new List<ChunkResult>
+                        {
+                            new ChunkResult
+                            {
+                                Tipo = "Documento",
+                                NomeMembro = Path.GetFileName(arquivo),
+                                Conteudo = conteudo
+                            }
+                        }
+                    };
 
                     foreach (var chunk in pedacos)
                     {
@@ -878,6 +868,71 @@ namespace RagScript.Hooks
 
             return string.Join(" | ", estrutura);
         }
+
+        private string ExtrairEstruturaXaml(string conteudoXaml)
+        {
+            if (string.IsNullOrWhiteSpace(conteudoXaml))
+                return "Arquivo XAML Vazio";
+
+            try
+            {
+                XElement root = XElement.Parse(conteudoXaml);
+                XNamespace xamlNs = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+                var estrutura = new List<string>();
+
+                // 1. Tipo do Nó Raiz (Window, UserControl, ResourceDictionary, Application)
+                string tipoRaiz = root.Name.LocalName;
+                estrutura.Add($"TipoRaiz: {tipoRaiz}");
+
+                // 2. Vínculo com Code-Behind (x:Class)
+                string? classeVinculada = root.Attribute(xamlNs + "Class")?.Value;
+                if (!string.IsNullOrEmpty(classeVinculada))
+                {
+                    estrutura.Add($"CodeBehind: {classeVinculada}");
+                }
+
+                // 3. Em caso de ResourceDictionary
+                if (tipoRaiz == "ResourceDictionary")
+                {
+                    var qtdRecursos = root.Elements().Count();
+                    estrutura.Add($"RecursosTotais: {qtdRecursos}");
+                    return string.Join(" | ", estrutura);
+                }
+
+                // 4. Captura Namespaces e Assemblies Importados (ex: xmlns:vms, xmlns:views)
+                var namespacesCustomizados = root.Attributes()
+                    .Where(a => a.IsNamespaceDeclaration && a.Name.LocalName != "xmlns" && a.Name.LocalName != "x")
+                    .Select(a => $"{a.Name.LocalName}->{a.Value.Split(';').First().Replace("clr-namespace:", "")}");
+
+                if (namespacesCustomizados.Any())
+                {
+                    estrutura.Add($"Imports: [{string.Join(", ", namespacesCustomizados.Take(4))}]");
+                }
+
+                // 5. Resumo de Controles Principais e Nomeados da Tela (máximo 6 para não estourar o resumo)
+                var controlesNomeados = root.Descendants()
+                    .Select(e => new
+                    {
+                        Tipo = e.Name.LocalName,
+                        Nome = e.Attribute(xamlNs + "Name")?.Value ?? e.Attribute("Name")?.Value
+                    })
+                    .Where(x => !string.IsNullOrEmpty(x.Nome))
+                    .Select(x => $"{x.Tipo}:{x.Nome}")
+                    .Take(6);
+
+                if (controlesNomeados.Any())
+                {
+                    estrutura.Add($"ControlesChave: [{string.Join(", ", controlesNomeados)}]");
+                }
+
+                return string.Join(" | ", estrutura);
+            }
+            catch
+            {
+                return "Estrutura XAML (Falha no Parse XML)";
+            }
+        }
     }
 
     public class RagSearchHook
@@ -1048,6 +1103,7 @@ public class ChunkResult
         public string Conteudo { get; set; } = string.Empty;
     }
 
+    //c# chunker
     public static class CodeChunker
     {
         public static List<ChunkResult> QuebrarCodigoCSharp(string codigo)
@@ -1259,5 +1315,201 @@ public class ChunkResult
             Types.Add(node);
             base.VisitEnumDeclaration(node);
         }
+    }
+}
+
+//xaml chunker
+public static class XamlChunker
+{
+    private static readonly XNamespace XamlNs = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+    public static List<ChunkResult> QuebrarCodigoXaml(string conteudoXaml, string nomeArquivo)
+    {
+        if (string.IsNullOrWhiteSpace(conteudoXaml))
+            return new List<ChunkResult>(0);
+
+        try
+        {
+            XElement root = XElement.Parse(conteudoXaml);
+
+            // MELHORIA 1: Limpeza de comentários XML antigos/comentados para evitar ruído
+            root.Descendants().OfType<XComment>().Remove();
+
+            var chunks = new List<ChunkResult>();
+
+            string localName = root.Name.LocalName;
+            string classeVinculada = root.Attribute(XamlNs + "Class")?.Value ?? "SemCodeBehind";
+
+            // CASO 1: ResourceDictionary puro (Dicionários isolados)
+            if (localName == "ResourceDictionary")
+            {
+                ProcessarResourceDictionaryPuro(root, nomeArquivo, chunks);
+                return chunks.Count > 0 ? chunks : CriarChunkFallback(conteudoXaml, nomeArquivo, localName);
+            }
+
+            // CASO 2: App.xaml (Configurações globais e inicialização)
+            if (localName == "Application")
+            {
+                string startupUri = root.Attribute("StartupUri")?.Value ?? "Não especificado";
+                chunks.Add(new ChunkResult
+                {
+                    Tipo = "ConfiguracaoAppXaml",
+                    NomeMembro = "ApplicationStartup",
+                    HierarquiaCompleta = $"{nomeArquivo} -> Application",
+                    DocumentacaoXml = $"Configuração global da aplicação. Tela inicial configurada: {startupUri}",
+                    Conteudo = $"<Application StartupUri=\"{startupUri}\" x:Class=\"{classeVinculada}\" />"
+                });
+            }
+
+            // EXTRAÇÃO DE RECURSOS E TEMPLATES: Recorre nós de recursos em Window/UserControl/Application
+            var nosRecursos = root.Descendants().Where(e => e.Name.LocalName.EndsWith(".Resources"));
+            foreach (var noRes in nosRecursos)
+            {
+                ExtrairRecursosDoNo(noRes.Elements(), nomeArquivo, localName, classeVinculada, chunks);
+            }
+
+            // EXTRAÇÃO DE ELEMENTOS INTERATIVOS E ESTRUTURAIS:
+            // MELHORIA 2: Captura elementos nomeados (x:Name) OU elementos com Command/Binding funcional
+            var elementosRelevantes = root.Descendants()
+                .Where(e => !e.Ancestors().Any(a => a.Name.LocalName.EndsWith(".Resources")))
+                .Where(e => e.Attribute(XamlNs + "Name") != null ||
+                            e.Attribute("Name") != null ||
+                            e.Attribute("Command") != null ||
+                            (e.Attribute("ItemsSource") != null && e.Attribute("ItemsSource")!.Value.Contains("Binding")));
+
+            foreach (var elem in elementosRelevantes)
+            {
+                string nomeControle = elem.Attribute(XamlNs + "Name")?.Value
+                                   ?? elem.Attribute("Name")?.Value
+                                   ?? ObterIdentificadorPorBindingOuComando(elem);
+
+                string comandoAtribuido = elem.Attribute("Command")?.Value;
+                string docComplementar = !string.IsNullOrEmpty(comandoAtribuido)
+                    ? $" [Comando vinculado: {comandoAtribuido}]"
+                    : string.Empty;
+
+                chunks.Add(new ChunkResult
+                {
+                    Tipo = $"ControleXaml ({elem.Name.LocalName})",
+                    NomeMembro = nomeControle,
+                    HierarquiaCompleta = $"{nomeArquivo} -> {classeVinculada} -> {nomeControle}",
+                    DocumentacaoXml = $"Elemento {elem.Name.LocalName} na interface.{docComplementar}",
+                    Conteudo = SanitizarConteudoXaml(elem.ToString().Trim())
+                });
+            }
+
+            return chunks.Count > 0 ? chunks : CriarChunkFallback(conteudoXaml, nomeArquivo, localName);
+        }
+        catch
+        {
+            return CriarChunkFallback(conteudoXaml, nomeArquivo, "XamlComErro");
+        }
+    }
+
+    private static void ProcessarResourceDictionaryPuro(XElement root, string nomeArquivo, List<ChunkResult> chunks)
+    {
+        var merged = root.Descendants().FirstOrDefault(e => e.Name.LocalName == "ResourceDictionary.MergedDictionaries");
+        if (merged != null)
+        {
+            chunks.Add(new ChunkResult
+            {
+                Tipo = "MergedDictionaries",
+                NomeMembro = "Imports",
+                HierarquiaCompleta = $"{nomeArquivo} -> MergedDictionaries",
+                DocumentacaoXml = "Dicionários de recursos externos importados neste arquivo",
+                Conteudo = SanitizarConteudoXaml(merged.ToString().Trim())
+            });
+        }
+
+        var recursosDiretos = root.Elements().Where(e => e.Name.LocalName != "ResourceDictionary.MergedDictionaries");
+        ExtrairRecursosDoNo(recursosDiretos, nomeArquivo, "ResourceDictionary", "Global", chunks);
+    }
+
+    private static void ExtrairRecursosDoNo(IEnumerable<XElement> elementos, string nomeArquivo, string containerPai, string classeVinculada, List<ChunkResult> chunks)
+    {
+        foreach (var child in elementos)
+        {
+            // MELHORIA 3: Suporte completo para DataTemplates implícitos via DataType
+            string? dataType = child.Attribute("DataType")?.Value;
+            string? key = child.Attribute(XamlNs + "Key")?.Value;
+            string? targetType = child.Attribute("TargetType")?.Value;
+
+            string chave = key
+                        ?? (!string.IsNullOrEmpty(dataType) ? $"ImplicitDataTemplate ({ExtrairNomeClassePura(dataType)})" : null)
+                        ?? (!string.IsNullOrEmpty(targetType) ? $"Style ({ExtrairNomeClassePura(targetType)})" : null)
+                        ?? child.Name.LocalName;
+
+            string tipoContexto = !string.IsNullOrEmpty(dataType)
+                ? $"DataTemplate Implicito para {dataType}"
+                : $"Recurso {child.Name.LocalName}";
+
+            chunks.Add(new ChunkResult
+            {
+                Tipo = $"RecursoXaml ({child.Name.LocalName})",
+                NomeMembro = chave,
+                HierarquiaCompleta = $"{nomeArquivo} -> {containerPai} -> {chave}",
+                DocumentacaoXml = $"{tipoContexto} definido em {containerPai} (Classe: {classeVinculada})",
+                Conteudo = SanitizarConteudoXaml(child.ToString().Trim())
+            });
+        }
+    }
+
+    private static string ObterIdentificadorPorBindingOuComando(XElement elem)
+    {
+        string? cmd = elem.Attribute("Command")?.Value;
+        if (!string.IsNullOrEmpty(cmd))
+            return $"ActionNode ({ExtrairNomeBindingPuro(cmd)})";
+
+        string? items = elem.Attribute("ItemsSource")?.Value;
+        if (!string.IsNullOrEmpty(items))
+            return $"ListNode ({ExtrairNomeBindingPuro(items)})";
+
+        return $"{elem.Name.LocalName}_SemNome";
+    }
+
+    private static string ExtrairNomeClassePura(string valor)
+    {
+        if (valor.Contains("{x:Type"))
+        {
+            var match = Regex.Match(valor, @"{x:Type\s+(?:[^:]+:)?([^}]+)}");
+            if (match.Success) return match.Groups[1].Value.Trim();
+        }
+        return valor.Split(':').Last().Trim();
+    }
+
+    private static string ExtrairNomeBindingPuro(string valorBinding)
+    {
+        var match = Regex.Match(valorBinding, @"Path=([^,}]+)|Binding\s+([^,}]+)");
+        if (match.Success)
+        {
+            string resultado = !string.IsNullOrEmpty(match.Groups[1].Value) ? match.Groups[1].Value : match.Groups[2].Value;
+            return resultado.Trim();
+        }
+        return valorBinding.Replace("{", "").Replace("}", "").Replace("Binding", "").Trim();
+    }
+
+    // MELHORIA 4: Limpeza e economia de tokens ao remover atributos puramente de posicionamento visual
+    private static string SanitizarConteudoXaml(string xamlText)
+    {
+        if (string.IsNullOrWhiteSpace(xamlText)) return string.Empty;
+
+        // Opcional: Remove atributos de margem e posicionamento repetitivos que poluem o vetor
+        string limpo = Regex.Replace(xamlText, @"\s+(Margin|Grid\.Row|Grid\.Column|Grid\.RowSpan|Grid\.ColumnSpan|Canvas\.Left|Canvas\.Top)=""[^""]*""", "");
+        return limpo;
+    }
+
+    private static List<ChunkResult> CriarChunkFallback(string conteudo, string nomeArquivo, string tipo)
+    {
+        return new List<ChunkResult>
+        {
+            new ChunkResult
+            {
+                Tipo = $"DocumentoXaml ({tipo})",
+                NomeMembro = Path.GetFileNameWithoutExtension(nomeArquivo),
+                HierarquiaCompleta = nomeArquivo,
+                DocumentacaoXml = "Arquivo XAML completo (sem divisões internas)",
+                Conteudo = conteudo
+            }
+        };
     }
 }
