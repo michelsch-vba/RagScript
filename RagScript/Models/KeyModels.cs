@@ -46,3 +46,5 @@ public enum TipoPreset
     AnaliseDeBugsESeguranca = 4,
     CriacaoDeTestesUnitarios = 5
 }
+
+public record ResultadoBusca(DocumentoVetorial Documento, float Similaridade);

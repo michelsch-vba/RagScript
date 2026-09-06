@@ -1,11 +1,13 @@
-﻿using FreeRag.IndexerConsole;
-using Google.GenAI;
+﻿using Google.GenAI;
 using Google.GenAI.Types;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using RagScript.Hooks;
+using RagScript.IndexerConsole;
 using RagScript.Models;
+using RagScript.Services;
+using Spectre.Console;
 using System;
 using System.Collections.Generic;
 using System.Drawing.Text;
@@ -460,6 +462,180 @@ namespace RagScript.Hooks
         {
             ".db", ".sqlite", ".db-shm", ".db-wal", ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".dll", ".exe", ".pdb"
         };
+
+        public async Task ProcessarAtualizacaoIncrementalAsync(
+    string caminhoPasta,
+    List<string> extensoes,
+    string caminhoBancoExistente)
+        {
+            await InicializarChavesAsync();
+
+            var motor = new MotorBuscaRAG(caminhoBancoExistente);
+            var sqliteRepo = new SqliteVectorRepository(caminhoBancoExistente);
+
+            // 1. Carrega os hashes do SQLite
+            var hashesNoBanco = motor.ObterHashesPorCaminho();
+
+            // 2. Lista os arquivos do disco
+            var arquivosNoDisco = ObterArquivosValidos(caminhoPasta)
+                .Where(f => extensoes.Contains(Path.GetExtension(f).ToLower()))
+                .ToList();
+
+            var caminhosNoDiscoRelativos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            int novosOuModificados = 0;
+            int ignoradosSemAlteracao = 0;
+
+            foreach (var arquivo in arquivosNoDisco)
+            {
+                string ext = Path.GetExtension(arquivo).ToLower();
+                if (ExtensoesBinariasIgnoradas.Contains(ext)) continue;
+
+                try
+                {
+                    string conteudo = await System.IO.File.ReadAllTextAsync(arquivo);
+                    if (string.IsNullOrWhiteSpace(conteudo)) continue;
+
+                    string caminhoRelativo = Path.GetRelativePath(caminhoPasta, arquivo);
+                    caminhosNoDiscoRelativos.Add(caminhoRelativo);
+
+                    string hashAtualDisco = GerarHashSHA256(conteudo);
+
+                    // Se o arquivo não mudou, pula a vetorização
+                    if (hashesNoBanco.TryGetValue(caminhoRelativo, out string? hashNoBanco) && hashNoBanco == hashAtualDisco)
+                    {
+                        ignoradosSemAlteracao++;
+                        continue;
+                    }
+
+                    AnsiConsole.MarkupLine($"\n[yellow]🔄 Arquivo alterado/novo detectado:[/] [bold white]{caminhoRelativo}[/]");
+                    novosOuModificados++;
+
+                    string metadadosExtraidos = ext switch
+                    {
+                        ".cs" => ExtrairEstruturaCSharp(conteudo),
+                        ".xaml" => ExtrairEstruturaXaml(conteudo),
+                        _ => $"Arquivo {ext}"
+                    };
+
+                    var pedacos = ext switch
+                    {
+                        ".cs" => CodeChunker.QuebrarCodigoCSharp(conteudo),
+                        ".xaml" => XamlChunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        _ => new List<ChunkResult>
+                {
+                    new ChunkResult
+                    {
+                        Tipo = "Documento",
+                        NomeMembro = Path.GetFileName(arquivo),
+                        Conteudo = conteudo
+                    }
+                }
+                    };
+
+                    var documentosParaInserir = new List<DocumentoVetorial>();
+
+                    // 💡 BARRA DE PROGRESSO DO SPECTRE.CONSOLE
+                    await AnsiConsole.Progress()
+                        .AutoClear(false)
+                        .Columns(new ProgressColumn[]
+                        {
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                    new RemainingTimeColumn(),
+                    new SpinnerColumn()
+                        })
+                        .StartAsync(async ctx =>
+                        {
+                            var task = ctx.AddTask($"[cyan]Vetorizando {Path.GetFileName(arquivo)}[/]", maxValue: pedacos.Count);
+
+                            foreach (var chunk in pedacos)
+                            {
+                                task.Description = $"[cyan]Chunk:[/] [green]{chunk.NomeMembro}[/]";
+
+                                string docXml = string.IsNullOrWhiteSpace(chunk.DocumentacaoXml)
+                                    ? string.Empty
+                                    : $"[DOC XML]:\n{chunk.DocumentacaoXml}\n";
+
+                                string textoParaEmbedding = $"[ARQUIVO: {caminhoRelativo}]\n" +
+                                                            $"[HIERARQUIA: {chunk.HierarquiaCompleta}]\n" +
+                                                            $"[TIPO/MEMBRO: {chunk.Tipo} -> {chunk.NomeMembro}]\n" +
+                                                            $"[ESTRUTURA/METADADOS: {metadadosExtraidos}]\n" +
+                                                            docXml +
+                                                            $"\n[CÓDIGO/CONTEÚDO]:\n{chunk.Conteudo}";
+
+                                float[] vectorValues = Array.Empty<float>();
+                                int tentativaChunk = 0;
+
+                                while (vectorValues.Length == 0 && tentativaChunk < 3)
+                                {
+                                    tentativaChunk++;
+                                    vectorValues = await GerarEmbeddingHttpAsync(textoParaEmbedding);
+
+                                    if (vectorValues.Length == 0 && tentativaChunk < 3)
+                                    {
+                                        await Task.Delay(2000);
+                                    }
+                                }
+
+                                if (vectorValues.Length > 0)
+                                {
+                                    string idUnicoChunk = GerarHashSHA256($"{caminhoRelativo}_{chunk.HierarquiaCompleta}_{chunk.NomeMembro}");
+
+                                    documentosParaInserir.Add(new DocumentoVetorial
+                                    {
+                                        IdChunk = idUnicoChunk,
+                                        CaminhoRelativo = caminhoRelativo,
+                                        NomeArquivo = Path.GetFileName(arquivo),
+                                        HashConteudo = hashAtualDisco,
+                                        TipoChunk = chunk.Tipo,
+                                        NomeMembro = chunk.NomeMembro,
+                                        HierarquiaCompleta = chunk.HierarquiaCompleta,
+                                        Metadados = metadadosExtraidos,
+                                        ConteudoTexto = chunk.Conteudo,
+                                        Embedding = vectorValues
+                                    });
+                                }
+
+                                task.Increment(1);
+                                await Task.Delay(1200); // Delay seguro entre chamadas da API
+                            }
+                        });
+
+                    // Insere no banco SQLite os vetores atualizados do arquivo
+                    if (documentosParaInserir.Any())
+                    {
+                        await sqliteRepo.InserirDocumentosVetoriaisAsync(documentosParaInserir);
+                        AnsiConsole.MarkupLine($"  [green]✅ {documentosParaInserir.Count} chunks atualizados com sucesso no SQLite![/]");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[red]❌ Erro ao processar arquivo {Path.GetFileName(arquivo)}: {ex.Message}[/]");
+                }
+            }
+
+            // 3. Remoção de arquivos excluídos
+            var arquivosDeletados = hashesNoBanco.Keys.Except(caminhosNoDiscoRelativos).ToList();
+            foreach (var arqDeletado in arquivosDeletados)
+            {
+                AnsiConsole.MarkupLine($"[red]🗑️ Removendo do RAG arquivo deletado:[/] {arqDeletado}");
+                await motor.RemoverChunksPorCaminhoAsync(arqDeletado);
+            }
+
+            // Painel de Resumo Final
+            var panel = new Spectre.Console.Panel(
+                $"⚡ [bold green]Arquivos Inalterados:[/] {ignoradosSemAlteracao}\n" +
+                $"🔄 [bold yellow]Arquivos Atualizados/Novos:[/] {novosOuModificados}\n" +
+                $"🗑️ [bold red]Arquivos Removidos:[/] {arquivosDeletados.Count}")
+            {
+                Header = new PanelHeader("[bold white]🎉 RESUMO DA ATUALIZAÇÃO INCREMENTAL[/]"),
+                Border = BoxBorder.Rounded
+            };
+
+            AnsiConsole.Write(panel);
+        }
 
         public string SelecionarPastaOrigem()
         {
@@ -1031,65 +1207,6 @@ namespace RagScript.Hooks
             }
 
             return sb.ToString();
-        }
-
-        public float CalcularScorePonderado(DocumentoVetorial doc, float[] embeddingPergunta, string perguntaUsuario)
-        {
-            float baseCosineSim = CalcularSimilaridadeCosseno(doc.Embedding, embeddingPergunta);
-
-            if (baseCosineSim <= 0f) return 0f;
-
-            float bonusMetadados = 0f;
-            string perguntaLower = perguntaUsuario.ToLowerInvariant();
-
-            if (!string.IsNullOrWhiteSpace(doc.NomeMembro) &&
-                doc.NomeMembro.Length > 2 &&
-                perguntaLower.Contains(doc.NomeMembro.ToLowerInvariant()))
-            {
-                bonusMetadados += 0.25f;
-            }
-
-            if (!string.IsNullOrWhiteSpace(doc.HierarquiaCompleta) &&
-                doc.HierarquiaCompleta.Split('.').Any(parte => parte.Length > 3 && perguntaLower.Contains(parte.ToLowerInvariant())))
-            {
-                bonusMetadados += 0.15f;
-            }
-
-            if (!string.IsNullOrWhiteSpace(doc.Metadados))
-            {
-                string metadadosLower = doc.Metadados.ToLowerInvariant();
-                int matches = perguntaLower.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                                           .Count(palavra => palavra.Length > 3 && metadadosLower.Contains(palavra));
-
-                if (matches > 0)
-                {
-                    bonusMetadados += Math.Min(matches * 0.05f, 0.15f);
-                }
-            }
-
-            return Math.Min(baseCosineSim + bonusMetadados, 1.0f);
-        }
-
-        public float CalcularSimilaridadeCosseno(float[] vetorA, float[] vetorB)
-        {
-            if (vetorA == null || vetorB == null || vetorA.Length != vetorB.Length)
-                return 0f;
-
-            float dotProduct = 0f;
-            float normaA = 0f;
-            float normaB = 0f;
-
-            for (int i = 0; i < vetorA.Length; i++)
-            {
-                dotProduct += vetorA[i] * vetorB[i];
-                normaA += vetorA[i] * vetorA[i];
-                normaB += vetorB[i] * vetorB[i];
-            }
-
-            if (normaA == 0f || normaB == 0f)
-                return 0f;
-
-            return dotProduct / ((float)Math.Sqrt(normaA) * (float)Math.Sqrt(normaB));
         }
 
     }

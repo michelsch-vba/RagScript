@@ -9,8 +9,9 @@ using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using SQLitePCL;
 
-namespace FreeRag.IndexerConsole
+namespace RagScript.IndexerConsole
 {
     internal class Program
     {
@@ -19,6 +20,7 @@ namespace FreeRag.IndexerConsole
         [STAThread]
         static async Task Main(string[] args)
         {
+            SQLitePCL.Batteries.Init();
             Console.OutputEncoding = Encoding.UTF8;
             Console.Title = "Gerador de RAG com Gemini - FreeRag";
 
@@ -32,9 +34,10 @@ namespace FreeRag.IndexerConsole
                 Console.WriteLine("=============================================\n");
                 Console.WriteLine("-------------Escolha uma opção---------------\n");
                 Console.WriteLine("1. Salvar ou editar API keys");
-                Console.WriteLine("2. Gerar RAG");
+                Console.WriteLine("2. Gerar RAG (Novo)");
                 Console.WriteLine("3. Consultar RAG (Busca Vetorial Local)");
-                Console.WriteLine("4. Sair");
+                Console.WriteLine("4. Atualizar RAG existente (Sincronização Incremental)");
+                Console.WriteLine("5. Sair");
                 Console.Write("\nDigite sua escolha: ");
 
                 string escolha = Console.ReadLine()?.Trim() ?? "";
@@ -88,6 +91,26 @@ namespace FreeRag.IndexerConsole
                         break;
 
                     case "4":
+                        if (!_apiKeysAtuais.Any())
+                        {
+                            ApiHook apiHook = new ApiHook();
+                            _apiKeysAtuais = await apiHook.ObteroudarKeysAsync();
+                        }
+
+                        if (_apiKeysAtuais.Any())
+                        {
+                            await Functions.AtualizarRagExistenteAsync();
+                        }
+                        else
+                        {
+                            Console.WriteLine("\n⚠️ Ao menos uma API Key válida é necessária para atualizar o RAG.");
+                        }
+
+                        Console.WriteLine("\nPressione qualquer tecla para voltar ao menu...");
+                        Console.ReadKey();
+                        break;
+
+                    case "5":
                         executando = false;
                         Console.WriteLine("\nEncerrando aplicação...");
                         break;

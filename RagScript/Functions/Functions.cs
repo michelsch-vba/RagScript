@@ -1,13 +1,17 @@
 ﻿using Google.GenAI;
 using RagScript.Hooks;
+using RagScript.IndexerConsole;
 using RagScript.Models;
+using RagScript.Services;
 using System;
 using System.Collections.Generic;
+using System.DirectoryServices.ActiveDirectory;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Spectre.Console;
 
 namespace RagScript.Funções
 {
@@ -78,6 +82,10 @@ namespace RagScript.Funções
             string nomeArquivoJson = $"rag_{DateTime.Now:yyyyMMdd_HHmmss}.json";
             string caminhoFinalJson = Path.Combine(pastaMeusRags, nomeArquivoJson);
 
+            SqliteVectorRepository sqliteRepo = new SqliteVectorRepository();
+
+            await sqliteRepo.InserirDocumentosVetoriaisAsync(documentosVetoriais);
+
             var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
             string jsonOutput = JsonSerializer.Serialize(documentosVetoriais, jsonOptions);
 
@@ -98,20 +106,21 @@ namespace RagScript.Funções
         {
             RagSearchHook ragHook = new RagSearchHook();
 
-            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-            string pastaMeusRags = Path.Combine(pastaDocumentos, "Meus_RAGs");
+            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string pastaMeusRags = Path.Combine(pastaDocumentos, "MeuRAGApp");
 
             if (!Directory.Exists(pastaMeusRags))
             {
-                Console.WriteLine("⚠️ A pasta 'Meus_RAGs' ainda não existe. Gere um RAG primeiro (Opção 2).");
+                Console.WriteLine("⚠️ A pasta 'MeuRAGApp' ainda não existe. Gere um RAG primeiro.");
+                Directory.CreateDirectory(pastaMeusRags);
                 return;
             }
 
-            var arquivosRag = Directory.GetFiles(pastaMeusRags, "*.json").OrderByDescending(f => f).ToList();
+            var arquivosRag = Directory.GetFiles(pastaMeusRags, "*.db").OrderByDescending(f => f).ToList();
 
             if (!arquivosRag.Any())
             {
-                Console.WriteLine("⚠️ Nenhum arquivo de RAG (.json) foi encontrado em Meus_RAGs.");
+                Console.WriteLine("⚠️ Nenhum arquivo de RAG (.db) foi encontrado em MeuRAGApp.");
                 return;
             }
 
@@ -130,64 +139,55 @@ namespace RagScript.Funções
             }
 
             string caminhoRagEscolhido = arquivosRag[escolha - 1];
+            var motorBusca = new MotorBuscaRAG(caminhoRagEscolhido);
 
-            Console.WriteLine("\n🔄 Carregando base vetorial...");
-            List<DocumentoVetorial>? baseVetorial = null;
-
-            try
-            {
-                string jsonConteudo = await File.ReadAllTextAsync(caminhoRagEscolhido);
-                baseVetorial = JsonSerializer.Deserialize<List<DocumentoVetorial>>(jsonConteudo);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Erro ao ler o arquivo RAG: {ex.Message}");
-                return;
-            }
-
-            if (baseVetorial == null || !baseVetorial.Any())
-            {
-                Console.WriteLine("❌ A base de RAG está vazia ou é inválida.");
-                return;
-            }
-
-            Console.WriteLine($"✅ Base carregada! Total de documentos vetorizados: {baseVetorial.Count}");
+            // Carrega todas as opções do SQLite para o seletor TUI
+            List<string> sugestoesCodebase = motorBusca.ObterSugestoesMembros();
 
             while (true)
             {
                 Console.WriteLine("\n---------------------------------------------");
-                Console.Write("❓ Digite sua pergunta sobre o projeto (ou 'sair' para voltar): ");
-                string pergunta = Console.ReadLine()?.Trim() ?? string.Empty;
+
+                // Chama o leitor de linha de comando que abre a TUI ao apertar '\'
+                string pergunta = ConsoleInputManager.LerPerguntaComSeletor(
+                    "❓ Digite sua pergunta (aperte '\\' para abrir o seletor): ",
+                    sugestoesCodebase
+                )?.Trim() ?? string.Empty;
 
                 if (string.IsNullOrEmpty(pergunta)) continue;
                 if (pergunta.Equals("sair", StringComparison.OrdinalIgnoreCase)) break;
 
-                Console.Write("🧠 Vetorizando sua pergunta...");
+                Console.Write("\n🧠 Vetorizando sua pergunta...");
 
                 float[] embeddingPergunta = await ragHook.GerarEmbeddingPerguntaAsync(pergunta);
 
-                if (embeddingPergunta.Length == 0)
+                if (embeddingPergunta == null || embeddingPergunta.Length == 0)
                 {
                     Console.WriteLine("\n❌ Não foi possível gerar o vetor para a sua pergunta. Tente novamente.");
                     continue;
                 }
                 Console.WriteLine(" ✅ OK");
 
-                Console.Write("🔍 Buscando trechos mais relevantes...");
-                var resultadosOrdenados = baseVetorial
-                    .Select(doc => new
-                    {
-                        Documento = doc,
-                        Similaridade = ragHook.CalcularScorePonderado(doc, embeddingPergunta, pergunta)
-                    })
-                    .OrderByDescending(r => r.Similaridade)
-                    .Take(3)
-                    .ToList();
+                Console.Write("🔍 Buscando trechos mais relevantes via SIMD + SQLite...");
+
+                // Executa a busca com Top-K e Threshold
+                List<ResultadoBusca> resultados = motorBusca.BuscarTopK(
+                    embeddingPergunta: embeddingPergunta,
+                    perguntaUsuario: pergunta,
+                    topK: 5,
+                    threshold: 0.50f
+                );
 
                 Console.WriteLine(" ✅ OK\n");
 
+                if (!resultados.Any())
+                {
+                    Console.WriteLine("⚠️ Nenhum trecho relevante foi encontrado para essa pergunta (Score abaixo do limite de 50%).");
+                    continue;
+                }
+
                 Console.WriteLine("🎯 Trechos Encontrados:");
-                foreach (var res in resultadosOrdenados)
+                foreach (var res in resultados)
                 {
                     Console.WriteLine($"   📄 [{res.Documento.CaminhoRelativo}] -> {res.Documento.TipoChunk}: {res.Documento.NomeMembro} ({res.Similaridade * 100:F1}%)");
                 }
@@ -213,7 +213,10 @@ namespace RagScript.Funções
                     _ => TipoPreset.ArquiteturaERefatoracao
                 };
 
-                var docsRelevantes = resultadosOrdenados.Select(r => r.Documento).ToList();
+                // Extrai a lista de DocumentoVetorial com TODOS os metadados já preenchidos do SQLite
+                List<DocumentoVetorial> docsRelevantes = resultados.Select(r => r.Documento).ToList();
+
+                // Alimenta o hook de geração de pergunta estruturada
                 string promptEstruturado = ragHook.GerarPerguntaEstruturada(pergunta, docsRelevantes, presetEscolhido);
 
                 Console.WriteLine("\n📋 PROMPT ESTRUTURADO GERADO COM SUCESSO:");
@@ -252,6 +255,47 @@ namespace RagScript.Funções
                     Console.WriteLine("💡 Copie o texto exibido acima manualmente e cole no chat!");
                 }
             }
+        }
+    
+
+    public static async Task AtualizarRagExistenteAsync()
+        {
+            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string pastaMeusRags = Path.Combine(pastaDocumentos, "MeuRAGApp");
+
+            var arquivosRag = Directory.GetFiles(pastaMeusRags, "*.db").OrderByDescending(f => f).ToList();
+            if (!arquivosRag.Any())
+            {
+                Console.WriteLine("⚠️ Nenhum arquivo de RAG (.db) encontrado para atualizar.");
+                return;
+            }
+
+            Console.WriteLine("\n📚 Escolha o RAG (.db) que deseja atualizar:");
+            for (int i = 0; i < arquivosRag.Count; i++)
+            {
+                Console.WriteLine($"[{i + 1}] {Path.GetFileName(arquivosRag[i])}");
+            }
+            Console.Write("Digite o número desejado: ");
+
+            if (!int.TryParse(Console.ReadLine()?.Trim(), out int escolha) || escolha < 1 || escolha > arquivosRag.Count)
+            {
+                Console.WriteLine("❌ Seleção inválida.");
+                return;
+            }
+
+            string caminoDbEscolhido = arquivosRag[escolha - 1];
+
+            RagHook ragHook = new RagHook();
+            Console.WriteLine("\n📂 Selecione a pasta da codebase atualizada na janela do Windows...");
+            string pastaOrigem = ragHook.SelecionarPastaOrigem();
+
+            if (string.IsNullOrEmpty(pastaOrigem)) return;
+
+            List<string> extensoes = ragHook.SelecionarExtensoes(pastaOrigem);
+            if (!extensoes.Any()) return;
+
+            // Executa a sincronização inteligente
+            await ragHook.ProcessarAtualizacaoIncrementalAsync(pastaOrigem, extensoes, caminoDbEscolhido);
         }
     }
 }
