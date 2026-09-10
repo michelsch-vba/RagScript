@@ -30,7 +30,7 @@ namespace RagScript.IndexerConsole
             {
                 Console.Clear();
                 Console.WriteLine("=============================================");
-                Console.WriteLine("   GERADOR DE RAG EM JSON (GEMINI API)       ");
+                Console.WriteLine("         GERADOR DE RAG (GEMINI API)         ");
                 Console.WriteLine("=============================================\n");
                 Console.WriteLine("-------------Escolha uma opção---------------\n");
                 Console.WriteLine("1. Salvar ou editar API keys");

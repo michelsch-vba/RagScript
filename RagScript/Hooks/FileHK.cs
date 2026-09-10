@@ -17,12 +17,8 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Forms;
 using System.Xml.Linq;
-using static RagScript.Hooks.CodeChunker;
+using  RagScript.Chunker;
 
 namespace RagScript.Hooks
 {
@@ -192,8 +188,10 @@ namespace RagScript.Hooks
 
         private async Task<List<string>?> CadastrarNovasChaves(List<string> listaAtual)
         {
+            string[] comandosSair = { "sair", "terminar", "fechar", "exit", "cancelar" };
+
             Console.WriteLine("------------------------------------------------------");
-            Console.WriteLine("\nEscolha uma das opções:");
+            Console.WriteLine("\nEscolha uma das opções ou digite 'sair':");
             Console.WriteLine("[1] Cadastrar uma lista nova de chaves (Sobrescrever)");
             Console.WriteLine("[2] Mudar/Substituir uma chave específica");
             Console.WriteLine("[3] Deletar uma chave específica");
@@ -203,6 +201,11 @@ namespace RagScript.Hooks
             {
                 Console.Write("\nEscolha uma opção: ");
                 string opcao = Console.ReadLine()?.Trim() ?? string.Empty;
+
+                if (comandosSair.Contains(opcao, StringComparer.OrdinalIgnoreCase))
+                {
+                    return listaAtual;
+                }
 
                 if (opcao == "1")
                 {
@@ -226,7 +229,7 @@ namespace RagScript.Hooks
                 else if (opcao == "4")
                 {
                     return await DeletarChavesInvalidasAsync(listaAtual);
-                }
+                }             
                 else
                 {
                     Console.WriteLine("Opção inválida.");
@@ -464,9 +467,9 @@ namespace RagScript.Hooks
         };
 
         public async Task ProcessarAtualizacaoIncrementalAsync(
-    string caminhoPasta,
-    List<string> extensoes,
-    string caminhoBancoExistente)
+            string caminhoPasta,
+            List<string> extensoes,
+            string caminhoBancoExistente)
         {
             await InicializarChavesAsync();
 
@@ -520,8 +523,11 @@ namespace RagScript.Hooks
 
                     var pedacos = ext switch
                     {
-                        ".cs" => CodeChunker.QuebrarCodigoCSharp(conteudo),
-                        ".xaml" => XamlChunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        ".cs" => Csharp_Chunker.QuebrarCodigoCSharp(conteudo),
+                        ".xaml" => Xaml_Chunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        ".slnx" => Sln_Chunker.QuebrarCodigoSln(conteudo, Path.GetFileName(arquivo)),
+                        ".csproj" => Csproj_Chunker.QuebrarCodigoCsproj(conteudo, Path.GetFileName(arquivo)),
+                        ".editorconfig" => EditorConfig_Chunker.QuebrarCodigoEditorConfig(conteudo, Path.GetFileName(arquivo)),
                         _ => new List<ChunkResult>
                 {
                     new ChunkResult
@@ -823,20 +829,23 @@ namespace RagScript.Hooks
                         ".xaml" => ExtrairEstruturaXaml(conteudo),
                         _ => $"Arquivo {ext}"
                     };
-                    
+
                     var pedacos = ext switch
                     {
-                        ".cs" => CodeChunker.QuebrarCodigoCSharp(conteudo),
-                        ".xaml" => XamlChunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        ".cs" => Csharp_Chunker.QuebrarCodigoCSharp(conteudo),
+                        ".xaml" => Xaml_Chunker.QuebrarCodigoXaml(conteudo, Path.GetFileName(arquivo)),
+                        ".slnx" => Sln_Chunker.QuebrarCodigoSln(conteudo, Path.GetFileName(arquivo)),
+                        ".csproj" => Csproj_Chunker.QuebrarCodigoCsproj(conteudo, Path.GetFileName(arquivo)),
+                        ".editorconfig" => EditorConfig_Chunker.QuebrarCodigoEditorConfig(conteudo, Path.GetFileName(arquivo)),
                         _ => new List<ChunkResult>
-                        {
-                            new ChunkResult
-                            {
-                                Tipo = "Documento",
-                                NomeMembro = Path.GetFileName(arquivo),
-                                Conteudo = conteudo
-                            }
-                        }
+                {
+                    new ChunkResult
+                    {
+                        Tipo = "Documento",
+                        NomeMembro = Path.GetFileName(arquivo),
+                        Conteudo = conteudo
+                    }
+                }
                     };
 
                     foreach (var chunk in pedacos)
@@ -1211,422 +1220,12 @@ namespace RagScript.Hooks
 
     }
 
-public class ChunkResult
-    {
-        public string Tipo { get; set; } = string.Empty;
-        public string NomeMembro { get; set; } = string.Empty;
-        public string HierarquiaCompleta { get; set; } = string.Empty;
-        public string DocumentacaoXml { get; set; } = string.Empty; // NOVO: Metadado extraído da AST
-        public string Conteudo { get; set; } = string.Empty;
-    }
 
-    //c# chunker
-    public static class CodeChunker
-    {
-        public static List<ChunkResult> QuebrarCodigoCSharp(string codigo)
-        {
-            if (string.IsNullOrWhiteSpace(codigo))
-                return new List<ChunkResult>(0);
 
-            SyntaxTree tree = CSharpSyntaxTree.ParseText(codigo);
-            CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
+    
 
-            var collector = new CSharpSyntaxCollector();
-            collector.Visit(root);
-
-            int totalMembros = collector.Methods.Count + collector.Constructors.Count + collector.Properties.Count;
-            int totalElementos = totalMembros + collector.Types.Count;
-
-            if (totalElementos == 0)
-            {
-                return new List<ChunkResult>(1)
-            {
-                new ChunkResult
-                {
-                    Tipo = "Arquivo/Estrutura",
-                    NomeMembro = "Geral",
-                    HierarquiaCompleta = "Geral",
-                    DocumentacaoXml = string.Empty,
-                    Conteudo = codigo
-                }
-            };
-            }
-
-            // PREFERÊNCIA 1: Granularidade fina (Membros)
-            if (totalMembros > 0)
-            {
-                var chunks = new List<ChunkResult>(totalMembros);
-
-                foreach (var method in collector.Methods)
-                {
-                    chunks.Add(new ChunkResult
-                    {
-                        Tipo = "Metodo",
-                        NomeMembro = method.Identifier.Text,
-                        HierarquiaCompleta = ObterCaminhoHierarquico(method),
-                        DocumentacaoXml = ExtrairSummaryXml(method),
-                        Conteudo = method.ToFullString().Trim()
-                    });
-                }
-
-                foreach (var ctor in collector.Constructors)
-                {
-                    chunks.Add(new ChunkResult
-                    {
-                        Tipo = "Construtor",
-                        NomeMembro = ctor.Identifier.Text,
-                        HierarquiaCompleta = ObterCaminhoHierarquico(ctor),
-                        DocumentacaoXml = ExtrairSummaryXml(ctor),
-                        Conteudo = ctor.ToFullString().Trim()
-                    });
-                }
-
-                foreach (var prop in collector.Properties)
-                {
-                    chunks.Add(new ChunkResult
-                    {
-                        Tipo = "Propriedade",
-                        NomeMembro = prop.Identifier.Text,
-                        HierarquiaCompleta = ObterCaminhoHierarquico(prop),
-                        DocumentacaoXml = ExtrairSummaryXml(prop),
-                        Conteudo = prop.ToFullString().Trim()
-                    });
-                }
-
-                return chunks;
-            }
-
-            // PREFERÊNCIA 2: Granularidade estrutural (Tipos)
-            var typeChunks = new List<ChunkResult>(collector.Types.Count);
-            foreach (var typeNode in collector.Types)
-            {
-                typeChunks.Add(new ChunkResult
-                {
-                    Tipo = ObterNomeTipo(typeNode.Kind()),
-                    NomeMembro = typeNode.Identifier.Text,
-                    HierarquiaCompleta = ObterCaminhoHierarquico(typeNode),
-                    DocumentacaoXml = ExtrairSummaryXml(typeNode),
-                    Conteudo = typeNode.ToFullString().Trim()
-                });
-            }
-
-            return typeChunks;
-        }
-
-        private static string ExtrairSummaryXml(SyntaxNode node)
-        {
-            var docComment = node.GetLeadingTrivia()
-                .Select(t => t.GetStructure())
-                .OfType<DocumentationCommentTriviaSyntax>()
-                .FirstOrDefault();
-
-            if (docComment == null)
-                return string.Empty;
-
-            var summaryNode = docComment.Content
-                .OfType<XmlElementSyntax>()
-                .FirstOrDefault(e => e.StartTag.Name.ToString().Equals("summary", StringComparison.OrdinalIgnoreCase));
-
-            if (summaryNode == null)
-                return string.Empty;
-
-            // Limpa as barras /// e os espaços extras mantendo o texto interno
-            return summaryNode.Content.ToString()
-                .Replace("///", "")
-                .Trim();
-        }
-
-        private static string ObterCaminhoHierarquico(SyntaxNode node)
-        {
-            Span<int> boundaries = stackalloc int[8];
-            var ancestrais = new List<string>(4);
-
-            for (SyntaxNode? atual = node.Parent; atual != null; atual = atual.Parent)
-            {
-                if (atual is BaseTypeDeclarationSyntax typeDecl)
-                {
-                    ancestrais.Add(typeDecl.Identifier.Text);
-                }
-                else if (atual is BaseNamespaceDeclarationSyntax nsDecl)
-                {
-                    ancestrais.Add(nsDecl.Name.ToString());
-                }
-            }
-
-            if (ancestrais.Count == 0) return string.Empty;
-            if (ancestrais.Count == 1) return ancestrais[0];
-
-            var sb = new StringBuilder(64);
-            for (int i = ancestrais.Count - 1; i >= 0; i--)
-            {
-                sb.Append(ancestrais[i]);
-                if (i > 0) sb.Append('.');
-            }
-
-            return sb.ToString();
-        }
-
-        private static string ObterNomeTipo(SyntaxKind kind) => kind switch
-        {
-            SyntaxKind.ClassDeclaration => "Class",
-            SyntaxKind.StructDeclaration => "Struct",
-            SyntaxKind.InterfaceDeclaration => "Interface",
-            SyntaxKind.EnumDeclaration => "Enum",
-            SyntaxKind.RecordDeclaration => "Record",
-            SyntaxKind.RecordStructDeclaration => "RecordStruct",
-            _ => "Type"
-        };
-    }
-
-    internal class CSharpSyntaxCollector : CSharpSyntaxWalker
-    {
-        public List<MethodDeclarationSyntax> Methods { get; } = new();
-        public List<BaseTypeDeclarationSyntax> Types { get; } = new();
-        public List<PropertyDeclarationSyntax> Properties { get; } = new();
-        public List<ConstructorDeclarationSyntax> Constructors { get; } = new();
-
-        public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
-        {
-            Methods.Add(node);
-            base.VisitMethodDeclaration(node);
-        }
-
-        public override void VisitPropertyDeclaration(PropertyDeclarationSyntax node)
-        {
-            Properties.Add(node);
-            base.VisitPropertyDeclaration(node);
-        }
-
-        public override void VisitConstructorDeclaration(ConstructorDeclarationSyntax node)
-        {
-            Constructors.Add(node);
-            base.VisitConstructorDeclaration(node);
-        }
-
-        public override void VisitClassDeclaration(ClassDeclarationSyntax node)
-        {
-            Types.Add(node);
-            base.VisitClassDeclaration(node);
-        }
-
-        public override void VisitStructDeclaration(StructDeclarationSyntax node)
-        {
-            Types.Add(node);
-            base.VisitStructDeclaration(node);
-        }
-
-        public override void VisitInterfaceDeclaration(InterfaceDeclarationSyntax node)
-        {
-            Types.Add(node);
-            base.VisitInterfaceDeclaration(node);
-        }
-
-        public override void VisitRecordDeclaration(RecordDeclarationSyntax node)
-        {
-            Types.Add(node);
-            base.VisitRecordDeclaration(node);
-        }
-
-        public override void VisitEnumDeclaration(EnumDeclarationSyntax node)
-        {
-            Types.Add(node);
-            base.VisitEnumDeclaration(node);
-        }
-    }
+    
 }
 
-//xaml chunker
-public static class XamlChunker
-{
-    private static readonly XNamespace XamlNs = "http://schemas.microsoft.com/winfx/2006/xaml";
 
-    public static List<ChunkResult> QuebrarCodigoXaml(string conteudoXaml, string nomeArquivo)
-    {
-        if (string.IsNullOrWhiteSpace(conteudoXaml))
-            return new List<ChunkResult>(0);
 
-        try
-        {
-            XElement root = XElement.Parse(conteudoXaml);
-
-            // MELHORIA 1: Limpeza de comentários XML antigos/comentados para evitar ruído
-            root.Descendants().OfType<XComment>().Remove();
-
-            var chunks = new List<ChunkResult>();
-
-            string localName = root.Name.LocalName;
-            string classeVinculada = root.Attribute(XamlNs + "Class")?.Value ?? "SemCodeBehind";
-
-            // CASO 1: ResourceDictionary puro (Dicionários isolados)
-            if (localName == "ResourceDictionary")
-            {
-                ProcessarResourceDictionaryPuro(root, nomeArquivo, chunks);
-                return chunks.Count > 0 ? chunks : CriarChunkFallback(conteudoXaml, nomeArquivo, localName);
-            }
-
-            // CASO 2: App.xaml (Configurações globais e inicialização)
-            if (localName == "Application")
-            {
-                string startupUri = root.Attribute("StartupUri")?.Value ?? "Não especificado";
-                chunks.Add(new ChunkResult
-                {
-                    Tipo = "ConfiguracaoAppXaml",
-                    NomeMembro = "ApplicationStartup",
-                    HierarquiaCompleta = $"{nomeArquivo} -> Application",
-                    DocumentacaoXml = $"Configuração global da aplicação. Tela inicial configurada: {startupUri}",
-                    Conteudo = $"<Application StartupUri=\"{startupUri}\" x:Class=\"{classeVinculada}\" />"
-                });
-            }
-
-            // EXTRAÇÃO DE RECURSOS E TEMPLATES: Recorre nós de recursos em Window/UserControl/Application
-            var nosRecursos = root.Descendants().Where(e => e.Name.LocalName.EndsWith(".Resources"));
-            foreach (var noRes in nosRecursos)
-            {
-                ExtrairRecursosDoNo(noRes.Elements(), nomeArquivo, localName, classeVinculada, chunks);
-            }
-
-            // EXTRAÇÃO DE ELEMENTOS INTERATIVOS E ESTRUTURAIS:
-            // MELHORIA 2: Captura elementos nomeados (x:Name) OU elementos com Command/Binding funcional
-            var elementosRelevantes = root.Descendants()
-                .Where(e => !e.Ancestors().Any(a => a.Name.LocalName.EndsWith(".Resources")))
-                .Where(e => e.Attribute(XamlNs + "Name") != null ||
-                            e.Attribute("Name") != null ||
-                            e.Attribute("Command") != null ||
-                            (e.Attribute("ItemsSource") != null && e.Attribute("ItemsSource")!.Value.Contains("Binding")));
-
-            foreach (var elem in elementosRelevantes)
-            {
-                string nomeControle = elem.Attribute(XamlNs + "Name")?.Value
-                                   ?? elem.Attribute("Name")?.Value
-                                   ?? ObterIdentificadorPorBindingOuComando(elem);
-
-                string comandoAtribuido = elem.Attribute("Command")?.Value;
-                string docComplementar = !string.IsNullOrEmpty(comandoAtribuido)
-                    ? $" [Comando vinculado: {comandoAtribuido}]"
-                    : string.Empty;
-
-                chunks.Add(new ChunkResult
-                {
-                    Tipo = $"ControleXaml ({elem.Name.LocalName})",
-                    NomeMembro = nomeControle,
-                    HierarquiaCompleta = $"{nomeArquivo} -> {classeVinculada} -> {nomeControle}",
-                    DocumentacaoXml = $"Elemento {elem.Name.LocalName} na interface.{docComplementar}",
-                    Conteudo = SanitizarConteudoXaml(elem.ToString().Trim())
-                });
-            }
-
-            return chunks.Count > 0 ? chunks : CriarChunkFallback(conteudoXaml, nomeArquivo, localName);
-        }
-        catch
-        {
-            return CriarChunkFallback(conteudoXaml, nomeArquivo, "XamlComErro");
-        }
-    }
-
-    private static void ProcessarResourceDictionaryPuro(XElement root, string nomeArquivo, List<ChunkResult> chunks)
-    {
-        var merged = root.Descendants().FirstOrDefault(e => e.Name.LocalName == "ResourceDictionary.MergedDictionaries");
-        if (merged != null)
-        {
-            chunks.Add(new ChunkResult
-            {
-                Tipo = "MergedDictionaries",
-                NomeMembro = "Imports",
-                HierarquiaCompleta = $"{nomeArquivo} -> MergedDictionaries",
-                DocumentacaoXml = "Dicionários de recursos externos importados neste arquivo",
-                Conteudo = SanitizarConteudoXaml(merged.ToString().Trim())
-            });
-        }
-
-        var recursosDiretos = root.Elements().Where(e => e.Name.LocalName != "ResourceDictionary.MergedDictionaries");
-        ExtrairRecursosDoNo(recursosDiretos, nomeArquivo, "ResourceDictionary", "Global", chunks);
-    }
-
-    private static void ExtrairRecursosDoNo(IEnumerable<XElement> elementos, string nomeArquivo, string containerPai, string classeVinculada, List<ChunkResult> chunks)
-    {
-        foreach (var child in elementos)
-        {
-            // MELHORIA 3: Suporte completo para DataTemplates implícitos via DataType
-            string? dataType = child.Attribute("DataType")?.Value;
-            string? key = child.Attribute(XamlNs + "Key")?.Value;
-            string? targetType = child.Attribute("TargetType")?.Value;
-
-            string chave = key
-                        ?? (!string.IsNullOrEmpty(dataType) ? $"ImplicitDataTemplate ({ExtrairNomeClassePura(dataType)})" : null)
-                        ?? (!string.IsNullOrEmpty(targetType) ? $"Style ({ExtrairNomeClassePura(targetType)})" : null)
-                        ?? child.Name.LocalName;
-
-            string tipoContexto = !string.IsNullOrEmpty(dataType)
-                ? $"DataTemplate Implicito para {dataType}"
-                : $"Recurso {child.Name.LocalName}";
-
-            chunks.Add(new ChunkResult
-            {
-                Tipo = $"RecursoXaml ({child.Name.LocalName})",
-                NomeMembro = chave,
-                HierarquiaCompleta = $"{nomeArquivo} -> {containerPai} -> {chave}",
-                DocumentacaoXml = $"{tipoContexto} definido em {containerPai} (Classe: {classeVinculada})",
-                Conteudo = SanitizarConteudoXaml(child.ToString().Trim())
-            });
-        }
-    }
-
-    private static string ObterIdentificadorPorBindingOuComando(XElement elem)
-    {
-        string? cmd = elem.Attribute("Command")?.Value;
-        if (!string.IsNullOrEmpty(cmd))
-            return $"ActionNode ({ExtrairNomeBindingPuro(cmd)})";
-
-        string? items = elem.Attribute("ItemsSource")?.Value;
-        if (!string.IsNullOrEmpty(items))
-            return $"ListNode ({ExtrairNomeBindingPuro(items)})";
-
-        return $"{elem.Name.LocalName}_SemNome";
-    }
-
-    private static string ExtrairNomeClassePura(string valor)
-    {
-        if (valor.Contains("{x:Type"))
-        {
-            var match = Regex.Match(valor, @"{x:Type\s+(?:[^:]+:)?([^}]+)}");
-            if (match.Success) return match.Groups[1].Value.Trim();
-        }
-        return valor.Split(':').Last().Trim();
-    }
-
-    private static string ExtrairNomeBindingPuro(string valorBinding)
-    {
-        var match = Regex.Match(valorBinding, @"Path=([^,}]+)|Binding\s+([^,}]+)");
-        if (match.Success)
-        {
-            string resultado = !string.IsNullOrEmpty(match.Groups[1].Value) ? match.Groups[1].Value : match.Groups[2].Value;
-            return resultado.Trim();
-        }
-        return valorBinding.Replace("{", "").Replace("}", "").Replace("Binding", "").Trim();
-    }
-
-    // MELHORIA 4: Limpeza e economia de tokens ao remover atributos puramente de posicionamento visual
-    private static string SanitizarConteudoXaml(string xamlText)
-    {
-        if (string.IsNullOrWhiteSpace(xamlText)) return string.Empty;
-
-        // Opcional: Remove atributos de margem e posicionamento repetitivos que poluem o vetor
-        string limpo = Regex.Replace(xamlText, @"\s+(Margin|Grid\.Row|Grid\.Column|Grid\.RowSpan|Grid\.ColumnSpan|Canvas\.Left|Canvas\.Top)=""[^""]*""", "");
-        return limpo;
-    }
-
-    private static List<ChunkResult> CriarChunkFallback(string conteudo, string nomeArquivo, string tipo)
-    {
-        return new List<ChunkResult>
-        {
-            new ChunkResult
-            {
-                Tipo = $"DocumentoXaml ({tipo})",
-                NomeMembro = Path.GetFileNameWithoutExtension(nomeArquivo),
-                HierarquiaCompleta = nomeArquivo,
-                DocumentacaoXml = "Arquivo XAML completo (sem divisões internas)",
-                Conteudo = conteudo
-            }
-        };
-    }
-}

@@ -174,7 +174,7 @@ namespace RagScript.Funções
                 List<ResultadoBusca> resultados = motorBusca.BuscarTopK(
                     embeddingPergunta: embeddingPergunta,
                     perguntaUsuario: pergunta,
-                    topK: 5,
+                    topK: 6,
                     threshold: 0.50f
                 );
 

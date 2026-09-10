@@ -48,3 +48,12 @@ public enum TipoPreset
 }
 
 public record ResultadoBusca(DocumentoVetorial Documento, float Similaridade);
+
+public class ChunkResult
+{
+    public string Tipo { get; set; } = string.Empty;
+    public string NomeMembro { get; set; } = string.Empty;
+    public string HierarquiaCompleta { get; set; } = string.Empty;
+    public string DocumentacaoXml { get; set; } = string.Empty; // NOVO: Metadado extraído da AST
+    public string Conteudo { get; set; } = string.Empty;
+}
