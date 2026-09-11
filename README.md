@@ -18,7 +18,7 @@ Diferente de frameworks RAG genéricos que tratam código como texto bruto (caus
 
 ## 🎥 Demonstração
 
-![RagScript CLI Demo](docs/RagScriptDemo.gif)
+![RagScript CLI Demo](RagScript/Docs/RagScriptDemo.gif)
 
 ---
 
