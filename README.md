@@ -61,3 +61,7 @@ Diferente de frameworks RAG genéricos que tratam código como texto bruto (caus
 ┌─────────────────────────┐
 │   Prompt Estruturado    │ ──> Copiado automaticamente para a Clipboard (Ctrl+V)
 └────────────┬────────────┘
+
+## 🎥 Demonstração
+
+![RagScript CLI Demo](docs/RagScriptDemo.gif)
