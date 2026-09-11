@@ -10,8 +10,9 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using SQLitePCL;
+using BenchmarkDotNet.Running;
 
-namespace RagScript.IndexerConsole
+namespace RagScript.Services
 {
     internal class Program
     {
@@ -20,9 +21,11 @@ namespace RagScript.IndexerConsole
         [STAThread]
         static async Task Main(string[] args)
         {
+            // Inicializa os drivers nativos do SQLite em C#
             SQLitePCL.Batteries.Init();
+
             Console.OutputEncoding = Encoding.UTF8;
-            Console.Title = "Gerador de RAG com Gemini - FreeRag";
+            Console.Title = "RagScript CLI - Motor de RAG Sintático .NET";
 
             bool executando = true;
 
@@ -30,7 +33,7 @@ namespace RagScript.IndexerConsole
             {
                 Console.Clear();
                 Console.WriteLine("=============================================");
-                Console.WriteLine("         GERADOR DE RAG (GEMINI API)         ");
+                Console.WriteLine("         RAGSCRIPT CLI (GEMINI API)         ");
                 Console.WriteLine("=============================================\n");
                 Console.WriteLine("-------------Escolha uma opção---------------\n");
                 Console.WriteLine("1. Salvar ou editar API keys");
@@ -51,12 +54,7 @@ namespace RagScript.IndexerConsole
                         break;
 
                     case "2":
-                        if (!_apiKeysAtuais.Any())
-                        {
-                            ApiHook apiHook = new ApiHook();
-                            _apiKeysAtuais = await apiHook.ObteroudarKeysAsync();
-                        }
-
+                        await GarantirChavesCarregadasAsync();
                         if (_apiKeysAtuais.Any())
                         {
                             await Functions.GerarRagCompletoAsync();
@@ -71,12 +69,7 @@ namespace RagScript.IndexerConsole
                         break;
 
                     case "3":
-                        if (!_apiKeysAtuais.Any())
-                        {
-                            ApiHook apiHook = new ApiHook();
-                            _apiKeysAtuais = await apiHook.ObteroudarKeysAsync();
-                        }
-
+                        await GarantirChavesCarregadasAsync();
                         if (_apiKeysAtuais.Any())
                         {
                             await Functions.ConsultarRagAsync();
@@ -91,12 +84,7 @@ namespace RagScript.IndexerConsole
                         break;
 
                     case "4":
-                        if (!_apiKeysAtuais.Any())
-                        {
-                            ApiHook apiHook = new ApiHook();
-                            _apiKeysAtuais = await apiHook.ObteroudarKeysAsync();
-                        }
-
+                        await GarantirChavesCarregadasAsync();
                         if (_apiKeysAtuais.Any())
                         {
                             await Functions.AtualizarRagExistenteAsync();
@@ -117,9 +105,19 @@ namespace RagScript.IndexerConsole
 
                     default:
                         Console.WriteLine("\n❌ Opção inválida. Tente novamente.");
-                        Task.Delay(1500).Wait();
+                        await Task.Delay(1500); // Uso de await não-bloqueante
                         break;
                 }
+            }
+        }
+
+        private static async Task GarantirChavesCarregadasAsync()
+        {
+            if (!_apiKeysAtuais.Any())
+            {
+                ApiHook apiHook = new ApiHook();
+                await apiHook.GarantirChavesCarregadasAsync();
+                _apiKeysAtuais = await apiHook.ObteroudarKeysAsync() ?? new List<string>();
             }
         }
     }

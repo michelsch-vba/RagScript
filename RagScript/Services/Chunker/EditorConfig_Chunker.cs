@@ -5,7 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace RagScript.Chunker
+namespace RagScript.Services.Chunker
 {
     public static class EditorConfig_Chunker
     {

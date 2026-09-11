@@ -6,7 +6,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 
-namespace RagScript.Chunker
+namespace RagScript.Services.Chunker
 {
     public static class Csproj_Chunker
     {

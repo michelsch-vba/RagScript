@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 using System.Xml.Linq;
 using RagScript.Models;
 
-namespace RagScript.Chunker
+namespace RagScript.Services.Chunker
 {
     public static class Xaml_Chunker
     {

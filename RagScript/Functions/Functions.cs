@@ -5,7 +5,6 @@ using RagScript.Models;
 using RagScript.Services;
 using System;
 using System.Collections.Generic;
-using System.DirectoryServices.ActiveDirectory;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -17,6 +16,13 @@ namespace RagScript.Funções
 {
     public static class Functions
     {
+        private static string ObterPastaBaseApp()
+        {
+            string pastaApp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeuRAGApp");
+            Directory.CreateDirectory(pastaApp);
+            return pastaApp;
+        }
+
         public static async Task<List<string>> GerenciarApiKeyAsync()
         {
             ApiHook apiHook = new ApiHook();
@@ -75,27 +81,20 @@ namespace RagScript.Funções
                 return;
             }
 
-            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-            string pastaMeusRags = Path.Combine(pastaDocumentos, "Meus_RAGs");
-            Directory.CreateDirectory(pastaMeusRags);
+            string pastaMeusRags = ObterPastaBaseApp();
+            string nomeNomeProjeto = new DirectoryInfo(pastaOrigem).Name;
+            string nomeArquivoDb = $"rag_{nomeNomeProjeto}_{DateTime.Now:yyyyMMdd_HHmmss}.db";
+            string caminhoFinalDb = Path.Combine(pastaMeusRags, nomeArquivoDb);
 
-            string nomeArquivoJson = $"rag_{DateTime.Now:yyyyMMdd_HHmmss}.json";
-            string caminhoFinalJson = Path.Combine(pastaMeusRags, nomeArquivoJson);
-
-            SqliteVectorRepository sqliteRepo = new SqliteVectorRepository();
-
+            // Grava diretamente no arquivo SQLite .db quantizado
+            SqliteVectorRepository sqliteRepo = new SqliteVectorRepository(caminhoFinalDb);
             await sqliteRepo.InserirDocumentosVetoriaisAsync(documentosVetoriais);
 
-            var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
-            string jsonOutput = JsonSerializer.Serialize(documentosVetoriais, jsonOptions);
-
-            await File.WriteAllTextAsync(caminhoFinalJson, jsonOutput);
-
             Console.WriteLine("\n=========================================================================");
-            Console.WriteLine("🎉 RAG GERADO E VETORIZADO COM SUCESSO!");
+            Console.WriteLine("🎉 RAG GERADO E VETORIZADO COM SUCESSO NO SQLITE!");
             Console.WriteLine("=========================================================================");
             Console.WriteLine($"📊 Total de Chunks/Vetores indexados: {documentosVetoriais.Count}");
-            Console.WriteLine($"💾 Arquivo salvo em: {caminhoFinalJson}");
+            Console.WriteLine($"💾 Banco SQLite salvo em: {caminhoFinalDb}");
             Console.WriteLine("=========================================================================");
             Console.WriteLine("\n👉 Pressione QUALQUER TECLA para voltar ao menu principal...");
 
@@ -105,16 +104,7 @@ namespace RagScript.Funções
         public static async Task ConsultarRagAsync()
         {
             RagSearchHook ragHook = new RagSearchHook();
-
-            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string pastaMeusRags = Path.Combine(pastaDocumentos, "MeuRAGApp");
-
-            if (!Directory.Exists(pastaMeusRags))
-            {
-                Console.WriteLine("⚠️ A pasta 'MeuRAGApp' ainda não existe. Gere um RAG primeiro.");
-                Directory.CreateDirectory(pastaMeusRags);
-                return;
-            }
+            string pastaMeusRags = ObterPastaBaseApp();
 
             var arquivosRag = Directory.GetFiles(pastaMeusRags, "*.db").OrderByDescending(f => f).ToList();
 
@@ -148,7 +138,6 @@ namespace RagScript.Funções
             {
                 Console.WriteLine("\n---------------------------------------------");
 
-                // Chama o leitor de linha de comando que abre a TUI ao apertar '\'
                 string pergunta = ConsoleInputManager.LerPerguntaComSeletor(
                     "❓ Digite sua pergunta (aperte '\\' para abrir o seletor): ",
                     sugestoesCodebase
@@ -170,7 +159,6 @@ namespace RagScript.Funções
 
                 Console.Write("🔍 Buscando trechos mais relevantes via SIMD + SQLite...");
 
-                // Executa a busca com Top-K e Threshold
                 List<ResultadoBusca> resultados = motorBusca.BuscarTopK(
                     embeddingPergunta: embeddingPergunta,
                     perguntaUsuario: pergunta,
@@ -192,9 +180,6 @@ namespace RagScript.Funções
                     Console.WriteLine($"   📄 [{res.Documento.CaminhoRelativo}] -> {res.Documento.TipoChunk}: {res.Documento.NomeMembro} ({res.Similaridade * 100:F1}%)");
                 }
 
-                // =========================================================================
-                // 💡 SELEÇÃO DE PRESET DINÂMICO
-                // =========================================================================
                 Console.WriteLine("\n🎯 Escolha o tipo de instrução do Prompt:");
                 Console.WriteLine("[1] 🏗️ Arquitetura & Refatoração (Padrão)");
                 Console.WriteLine("[2] ⚡ Sugestões de Melhoria & Performance");
@@ -213,10 +198,7 @@ namespace RagScript.Funções
                     _ => TipoPreset.ArquiteturaERefatoracao
                 };
 
-                // Extrai a lista de DocumentoVetorial com TODOS os metadados já preenchidos do SQLite
                 List<DocumentoVetorial> docsRelevantes = resultados.Select(r => r.Documento).ToList();
-
-                // Alimenta o hook de geração de pergunta estruturada
                 string promptEstruturado = ragHook.GerarPerguntaEstruturada(pergunta, docsRelevantes, presetEscolhido);
 
                 Console.WriteLine("\n📋 PROMPT ESTRUTURADO GERADO COM SUCESSO:");
@@ -256,12 +238,10 @@ namespace RagScript.Funções
                 }
             }
         }
-    
 
-    public static async Task AtualizarRagExistenteAsync()
+        public static async Task AtualizarRagExistenteAsync()
         {
-            string pastaDocumentos = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string pastaMeusRags = Path.Combine(pastaDocumentos, "MeuRAGApp");
+            string pastaMeusRags = ObterPastaBaseApp();
 
             var arquivosRag = Directory.GetFiles(pastaMeusRags, "*.db").OrderByDescending(f => f).ToList();
             if (!arquivosRag.Any())
@@ -294,7 +274,6 @@ namespace RagScript.Funções
             List<string> extensoes = ragHook.SelecionarExtensoes(pastaOrigem);
             if (!extensoes.Any()) return;
 
-            // Executa a sincronização inteligente
             await ragHook.ProcessarAtualizacaoIncrementalAsync(pastaOrigem, extensoes, caminoDbEscolhido);
         }
     }

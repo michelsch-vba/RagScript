@@ -18,7 +18,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
-using  RagScript.Chunker;
+using RagScript.Services.Chunker;
 
 namespace RagScript.Hooks
 {
@@ -29,7 +29,7 @@ namespace RagScript.Hooks
 
     public class ApiHook
     {
-        private readonly HttpClient _httpClient = new HttpClient();
+        public readonly HttpClient _httpClient = new HttpClient();
         private readonly List<string> _apiKeys = new();
         private readonly Dictionary<string, DateTime> _cooldowns = new();
         private int _chaveIndex = 0;
@@ -443,12 +443,12 @@ namespace RagScript.Hooks
     public class RagHook
     {
         private readonly ApiHook _apiHook;
-        private readonly HttpClient _httpClient;
+     
 
         public RagHook()
         {
             _apiHook = new ApiHook();
-            _httpClient = new HttpClient();
+            
         }
 
         public async Task InicializarChavesAsync()
@@ -903,7 +903,7 @@ namespace RagScript.Hooks
                             Console.WriteLine($"❌ Chunk [{chunk.NomeMembro}] descartado após 3 tentativas.");
                         }
 
-                        await Task.Delay(1500); // Delay seguro de 1500ms entre vetorizações
+                        await Task.Delay(200); // Delay seguro de 200ms entre vetorizações
                     }
                 }
                 catch (Exception ex)
@@ -951,7 +951,7 @@ namespace RagScript.Hooks
                         Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
                     };
 
-                    using var response = await _httpClient.SendAsync(request);
+                    using var response = await _apiHook._httpClient.SendAsync(request);
 
                     if ((int)response.StatusCode == 429)
                     {
