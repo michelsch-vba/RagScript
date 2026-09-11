@@ -1,7 +1,6 @@
 ﻿# 🚀 RagScript
 
-> **Engine de RAG Sintático e Busca Vetorial de Alta Performance para .NET (C# & XAML/WPF)**  
-*Indexação ultracompacta via Roslyn, quantização `int8` em SQLite BLOBs e busca acelerada via ferragens modernas (SIMD).*
+> **Engine de RAG Sintático e Busca Vetorial de Alta Performance para .NET (C# & XAML/WPF)** *Indexação ultracompacta via Roslyn, quantização `int8` em SQLite BLOBs e busca acelerada via ferragens modernas (SIMD).*
 
 [![.NET 8.0](https://img.shields.io/badge/.NET-8.0-blue.svg)](https://dotnet.microsoft.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,6 +13,12 @@
 O **RagScript** é um motor RAG (Retrieval-Augmented Generation) focado no ecossistema **.NET (C#, XAML/WPF, `.csproj`, `.slnx`)**. 
 
 Diferente de frameworks RAG genéricos que tratam código como texto bruto (causando estouro de janelas de contexto e perda de semântica), o RagScript utiliza a **API do Roslyn** e parsers de XML para realizar **chunking sintático**. Ele identifica métodos, tipos, propriedades, DataBindings e documentações XML Docs (`<summary>`), indexando os dados em uma base SQLite com quantização de vetores e busca vetorial por hardware via **SIMD**.
+
+---
+
+## 🎥 Demonstração
+
+![RagScript CLI Demo](docs/RagScriptDemo.gif)
 
 ---
 
@@ -31,37 +36,12 @@ Diferente de frameworks RAG genéricos que tratam código como texto bruto (caus
 
 ## 🏗️ Fluxo de Funcionamento
 
-```text
-┌─────────────────────────┐
-│  Código C# / XAML / XML │
-└────────────┬────────────┘
-             │ (Roslyn AST / Parser XML)
-             ▼
-┌─────────────────────────┐
-│   Chunking Sintático    │ ──> Captura de métodos, metadados e <summary>
-└────────────┬────────────┘
-             │ (Google Gemini API - gemini-embedding-001)
-             ▼
-┌─────────────────────────┐
-│   Vetor Float (3072d)   │
-└────────────┬────────────┘
-             │ (Normalização L2 + Quantização int8)
-             ▼
-┌─────────────────────────┐
-│  SQLite (Tabela Chunks) │ ──> Vetores salvos em BLOB (~3 KB / chunk)
-└────────────┬────────────┘
-             │
-             │  (Busca Vetorial Local)
-             ▼
-┌─────────────────────────┐
-│ SIMD + Re-ranking       │ ──> TensorPrimitives.Dot + Bônus de Metadados
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│   Prompt Estruturado    │ ──> Copiado automaticamente para a Clipboard (Ctrl+V)
-└────────────┬────────────┘
-
-## 🎥 Demonstração
-
-![RagScript CLI Demo](docs/RagScriptDemo.gif)
+```mermaid
+flowchart TD
+    A[📄 Código C# / XAML / XML] -->|Roslyn AST & XML Parser| B(🧩 Chunking Sintático)
+    B -->|Google Gemini API| C(🔢 Vetor Float32 - 3072d)
+    C -->|Normalização L2 + int8| D[(🗄️ SQLite BLOBs)]
+    
+    E[❓ Pergunta do Dev] -->|Gemini API| F(🔢 Vetor Pergunta)
+    D & F -->|TensorPrimitives SIMD| G(⚡ Busca Cosseno + Re-ranking)
+    G --> H[📋 Prompt Estruturado na Clipboard Ctrl+V]
