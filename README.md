@@ -48,7 +48,7 @@ Diferente de frameworks RAG genéricos que tratam código como texto bruto (caus
              │ (Normalização L2 + Quantização int8)
              ▼
 ┌─────────────────────────┐
-│   SQLite (Tabela Chunks)│ ──> Vetores salvos em BLOB (~3 KB / chunk)
+│  SQLite (Tabela Chunks) │ ──> Vetores salvos em BLOB (~3 KB / chunk)
 └────────────┬────────────┘
              │
              │  (Busca Vetorial Local)
